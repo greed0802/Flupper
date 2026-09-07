@@ -36,5 +36,10 @@ dist/
 # ...but DO allow synthetic test fixtures, which are safe by construction.
 !backend/tests/fixtures/**
 
-probe_report*.json
-probe_drawings*.json
+# Probe reports contain filenames, sheet names and client project names.
+# Match ANY probe output, not just the two names originally anticipated.
+probe*.json
+*probe*.json
+
+# Ad-hoc scratch/patch scripts generated during agent sessions.
+/patch*.py
