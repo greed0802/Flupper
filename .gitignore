@@ -11,3 +11,12 @@ venv/
 build/
 dist/
 .dart_tool/
+
+# Real project data must never be committed — see docs/DATA_ONBOARDING.md
+qs-data/
+data/
+*.zip
+*.bbx
+*.msk
+probe_report*.json
+probe_drawings*.json
