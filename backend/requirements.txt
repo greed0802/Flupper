@@ -6,6 +6,7 @@ pytest>=8.0
 # sqlite-vec>=0.1.6
 # fastapi>=0.111
 # uvicorn[standard]>=0.30
+# xlrd>=2.0.1  # legacy .xls (BIFF8) only - .xlsx support removed in 2.0
 # pandas>=2.2
 # openpyxl>=3.1
 # playwright>=1.44
