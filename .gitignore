@@ -12,11 +12,29 @@ build/
 dist/
 .dart_tool/
 
-# Real project data must never be committed — see docs/DATA_ONBOARDING.md
-qs-data/
-data/
+# ── Real project data must never be committed ─────────────────────────
+# See docs/DATA_ONBOARDING.md. These folders live inside the checkout on
+# the Windows workstation, so they are ignored wholesale rather than by
+# extension — a single missed pattern would leak client rates.
+/masterfile/
+/project/
+/qs-data/
+/data/
+
+# Belt and braces: never commit these anywhere in the tree.
 *.zip
 *.bbx
 *.msk
+*.xls
+*.xlsx
+*.xlsm
+*.pdf
+*.dwg
+*.dxf
+*.dgn
+
+# ...but DO allow synthetic test fixtures, which are safe by construction.
+!backend/tests/fixtures/**
+
 probe_report*.json
 probe_drawings*.json
