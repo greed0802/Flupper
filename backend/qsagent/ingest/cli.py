@@ -17,7 +17,7 @@ def _ingest_masterfile(store, project_id, masterfile):
     from ..contracts import (  # noqa
         EvidenceRef, EvidenceNode, Discipline, Quantity, Unit, QuantityClaim, Assumption,
     )
-    store.conn.execute("DELETE FROM evidence_nodes WHERE project_id=? AND node_type != 'document'", (project_id,))
+    store.conn.execute("DELETE FROM evidence_nodes WHERE project_id=?", (project_id,))
     store.conn.execute("DELETE FROM quantity_claims WHERE project_id=?", (project_id,))
 
 
