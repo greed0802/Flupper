@@ -80,6 +80,13 @@ class QSStore:
         self.close()
 
     # ------------------------------------------------------------- projects
+    def get_or_create_project(self, name: str, client: str | None = None,
+                              tender_no: str | None = None) -> int:
+        row = self.conn.execute("SELECT id FROM projects WHERE name=?", (name,)).fetchone()
+        if row:
+            return int(row["id"])
+        return self.create_project(name, client, tender_no)
+
     def create_project(self, name: str, client: str | None = None,
                        tender_no: str | None = None) -> int:
         cur = self.conn.execute(
