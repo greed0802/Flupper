@@ -117,6 +117,63 @@ def probe_xlsx(data: bytes) -> dict[str, Any]:
     return {"kind": "xlsx", "sheet_count": len(sheets), "sheets": sheets}
 
 
+
+def probe_xls(data: bytes) -> dict[str, Any]:
+    # Sheet names, headers, typemaps and outline status via xlrd.
+    try:
+        import xlrd
+    except ImportError:
+        return {'kind': 'xls', 'note': 'install xlrd>=2.0.1 for legacy .xls'}
+    
+    try:
+        try:
+            wb = xlrd.open_workbook(file_contents=data, formatting_info=True)
+            has_format = True
+        except NotImplementedError:
+            wb = xlrd.open_workbook(file_contents=data)
+            has_format = False
+    except Exception as exc:
+        return {'kind': 'xls', 'error': f'{type(exc).__name__}: {exc}'}
+
+    sheets = []
+    for ws in wb.sheets():
+        header, header_row = [], None
+        for r in range(min(ws.nrows, 25)):
+            cells = ws.row_values(r)
+            non_empty = [c for c in cells if c not in (None, '')]
+            if len(non_empty) >= 2 and all(isinstance(c, str) for c in non_empty):
+                header = [str(c).strip() for c in cells]
+                header_row = r + 1
+                break
+        
+        outline_levels = []
+        if has_format and ws.rowinfo_map:
+            levels = {info.outline_level for info in ws.rowinfo_map.values()}
+            outline_levels = sorted(levels)
+
+        col_types = {}
+        type_names = {0:'EMPTY', 1:'TEXT', 2:'NUMBER', 3:'DATE', 4:'BOOL', 5:'ERR', 6:'BLANK'}
+        if header_row and ws.nrows > header_row:
+            from collections import Counter
+            for cx in range(ws.ncols):
+                types_found = Counter(ws.cell_type(rx, cx) for rx in range(header_row, min(ws.nrows, header_row+50)))
+                val = {type_names.get(k, str(k)): v for k, v in types_found.items()}
+                col_types[str(cx)] = val
+
+        sheets.append({
+            'name': ws.name,
+            'max_row': ws.nrows,
+            'max_column': ws.ncols,
+            'header_row': header_row,
+            'columns': header,
+            'has_formatting_info': has_format,
+            'rowinfo_map_size': len(ws.rowinfo_map) if has_format else 0,
+            'outline_levels_found': outline_levels,
+            'col_types_sample': col_types,
+        })
+    return {'kind': 'xls', 'sheet_count': len(sheets), 'sheets': sheets}
+
+
 def probe_pdf(data: bytes) -> dict[str, Any]:
     """Page count plus drawing-number/revision patterns. No full text emitted."""
     info: dict[str, Any] = {"kind": "pdf", "bytes": len(data)}
@@ -215,6 +272,8 @@ def probe_archive(path: Path, redact_headers: bool = False) -> dict[str, Any]:
                     detail = probe_csv(data)
                 elif ext in {".xlsx", ".xlsm"}:
                     detail = probe_xlsx(data)
+                elif ext == ".xls":
+                    detail = probe_xls(data)
                 elif ext == ".pdf":
                     detail = probe_pdf(data)
                 else:
@@ -234,7 +293,65 @@ def probe_archive(path: Path, redact_headers: bool = False) -> dict[str, Any]:
     return report
 
 
+
+def probe_loose_dir(path: Path, redact_headers: bool = False) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        'archive': f'Loose files in {path.name}',
+        'archive_alias': _anon(path.name),
+        'size_mb': 0.0,
+        'entries': [],
+    }
+    ext_counter: Counter[str] = Counter()
+    by_ext: dict[str, list[Path]] = defaultdict(list)
+    
+    files = [p for p in path.rglob('*') if p.is_file() and p.suffix.lower() not in {'.DS_Store'}]
+    report['entry_count'] = len(files)
+    total_size = 0
+    for p in files:
+        sz = p.stat().st_size
+        total_size += sz
+        ext = p.suffix.lower()
+        ext_counter[ext] += 1
+        by_ext[ext].append(p)
+        
+    report['size_mb'] = round(total_size / 1e6, 2)
+    report['extension_histogram'] = dict(ext_counter.most_common())
+    report['sample_paths'] = [p.name for p in files[:25]]
+    
+    interesting = SPREADSHEET_EXT | DRAWING_EXT | MUDSHARK_EXT
+    for ext in [e for e in ext_counter if e in interesting]:
+        for filepath in by_ext[ext]:
+            try:
+                data = filepath.read_bytes()
+            except Exception as exc:
+                report['entries'].append({'name': filepath.name, 'error': str(exc)})
+                continue
+            
+            if ext in {'.csv', '.txt'}:
+                detail = probe_csv(data)
+            elif ext in {'.xlsx', '.xlsm'}:
+                detail = probe_xlsx(data)
+            elif ext == '.xls':
+                detail = probe_xls(data)
+            elif ext == '.pdf':
+                detail = probe_pdf(data)
+            else:
+                detail = probe_binary(filepath.name, data)
+                
+            if redact_headers:
+                detail.pop('columns', None)
+                for s in detail.get('sheets', []):
+                    s.pop('columns', None)
+
+            report['entries'].append({
+                'name': filepath.name,
+                'ext': ext,
+                **detail,
+            })
+    return report
+
 def main() -> int:
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("paths", nargs="+", help="zip files, or directories containing them")
@@ -244,23 +361,28 @@ def main() -> int:
     args = ap.parse_args()
 
     targets: list[Path] = []
+    dir_targets: list[Path] = []
     for raw in args.paths:
         p = Path(raw).expanduser()
         if p.is_dir():
             targets += sorted(p.rglob("*.zip"))
+            dir_targets.append(p)
         elif p.exists():
             targets.append(p)
         else:
             print(f"  ! not found: {p}", file=sys.stderr)
 
-    if not targets:
-        print("No archives found.", file=sys.stderr)
+    if not targets and not dir_targets:
+        print("No paths found.", file=sys.stderr)
         return 1
 
     reports = []
     for t in targets:
-        print(f"probing {t.name} ...", file=sys.stderr)
+        print(f"probing {t.name} (zip) ...", file=sys.stderr)
         reports.append(probe_archive(t, redact_headers=args.redact_headers))
+    for d in dir_targets:
+        print(f"probing {d.name} (loose dir) ...", file=sys.stderr)
+        reports.append(probe_loose_dir(d, redact_headers=args.redact_headers))
 
     out = Path(args.out)
     out.write_text(json.dumps(
