@@ -20,34 +20,34 @@ from qsagent.contracts import Discipline, Unit
 
 # 1. Paths verification
 def test_parse_file_name():
-    p1 = parse_file_name("Aldi_Dandenong_Results_31082026.xls")
+    p1 = parse_file_name("Retail_Store_Alpha_Results_31082026.xls")
     assert p1.report_type == "Results"
     assert p1.export_date == date(2026, 8, 31)
     assert p1.copy_index is None
     assert not p1.is_stale
 
-    p2 = parse_file_name("Aldi_Dandenong_Trench_Summary_28082026(2).xlsx")
+    p2 = parse_file_name("Retail_Store_Alpha_Trench_Summary_28082026(2).xlsx")
     assert p2.report_type == "Trench_Summary"
     assert p2.export_date == date(2026, 8, 28)
     assert p2.copy_index == 2
     assert p2.is_stale
 
-    p3 = parse_file_name("St Padre Pio Catholic Primary School - Stage 2_Masterfile_04092026.zip")
+    p3 = parse_file_name("Primary School West - Stage 2_Masterfile_04092026.zip")
     assert p3.report_type == "Masterfile"
     assert p3.export_date == date(2026, 9, 4)
 
 def test_parse_folder_path():
-    path = Path("D:/exports/masterfile/2026/August/Aldi Dandenong")
+    path = Path("D:/exports/masterfile/2026/August/Retail Store Alpha")
     parsed = parse_folder_path(path)
     assert parsed.year == 2026
     assert parsed.month == "August"
-    assert parsed.project_name == "Aldi Dandenong"
+    assert parsed.project_name == "Retail Store Alpha"
 
-    path2 = Path("/Volumes/Mac/masterfile/2026/September/02. St Padre Pio - Stage 2/")
+    path2 = Path("/Volumes/Mac/masterfile/2026/September/02. Primary School West - Stage 2/")
     parsed2 = parse_folder_path(path2)
     assert parsed2.year == 2026
     assert parsed2.month == "September"
-    assert parsed2.project_name == "St Padre Pio"
+    assert parsed2.project_name == "Primary School West"
 
 def test_pick_latest():
     f1 = parse_file_name("Proj_Results_10012026.xls")

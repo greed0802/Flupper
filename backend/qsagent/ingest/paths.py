@@ -3,9 +3,9 @@
 Supported patterns
 ------------------
 Layout A – loose files in a year/month/project directory:
-    masterfile/2026/August/Aldi Dandenong/
-        Aldi_Dandenong_Results_31082026.xls
-        Aldi_Dandenong_Trench_Summary_31082026.xlsx
+    masterfile/2026/August/Retail Store Alpha/
+        Retail_Store_Alpha_Results_31082026.xls
+        Retail_Store_Alpha_Trench_Summary_31082026.xlsx
 
 Layout B – single zip per project in a year/month directory.
 
