@@ -309,14 +309,30 @@ def _parse_areas_sheet(ws, file_name):
 
 
 def _parse_union_cut_total(ws, has_format):
+    """Sum the Cut (Bulked) column in the All Strata Operations union sheet.
+
+    Only OL=0 rows are counted — these are the group-level totals written by
+    Mudshark.  OL=1 (leaf) and OL=2 (material detail) rows carry the same
+    values again and must not be included or the total is multiplied by 3.
+
+    Matching _parse_volume_sheet, which also accumulates cut_total only from
+    OL=0 rows on the component sheets (Ground Layer, Structure, Trench Run).
+    """
     if ws.nrows < 2:
         return 0.0
     headers = _map_headers(ws.row_values(0))
     cut_col = next((c for c, (h, _) in headers.items() if "Cut (Bulked" in h), None)
     if cut_col is None:
         return 0.0
-    return sum(float(ws.cell_value(r, cut_col)) for r in range(1, ws.nrows)
-               if ws.cell_type(r, cut_col) == 2)
+    total = 0.0
+    for r in range(1, ws.nrows):
+        if ws.cell_type(r, cut_col) != 2:
+            continue
+        ri = ws.rowinfo_map.get(r) if has_format else None
+        ol = ri.outline_level if ri else 0
+        if ol == 0:   # group-level total rows only
+            total += float(ws.cell_value(r, cut_col))
+    return total
 
 
 # ─── main parse entry points ──────────────────────────────────────────────────

@@ -1,6 +1,10 @@
--- Flupper QS Agent Platform - single-store SQLite schema (Phase 1).
+-- Flupper QS Agent Platform - single-store SQLite schema.
 -- Every table is append-friendly; the audit journal is strictly append-only
 -- and enforced by triggers so runs can be deterministically replayed.
+--
+-- ingest_key (added Phase 2): deterministic sha256(file_hash|sheet|row|column)
+-- that enables INSERT ... ON CONFLICT(ingest_key) DO UPDATE so that
+-- re-ingesting one source file converges rather than deleting unrelated rows.
 
 PRAGMA foreign_keys = ON;
 
@@ -35,6 +39,8 @@ CREATE TABLE IF NOT EXISTS evidence_nodes (
                    ('document','drawing','element','quantity','rate','boq_line','assumption')),
     label        TEXT NOT NULL,
     discipline   TEXT NOT NULL DEFAULT 'UNKNOWN',
+    ingest_key   TEXT,   -- sha256(file_hash|sheet|row_index); NULL for non-machine rows
+                         -- Uniqueness enforced by ux_nodes_ingest_key (partial, WHERE NOT NULL)
     file_hash    TEXT,
     drawing_no   TEXT,
     revision     TEXT,
@@ -47,6 +53,8 @@ CREATE TABLE IF NOT EXISTS evidence_nodes (
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_project_type ON evidence_nodes(project_id, node_type);
+-- Note: ux_nodes_ingest_key is expressly created in db.py _apply_column_migrations() 
+-- to prevent 'no such column' errors when executing this script on legacy databases.
 
 -- Directed relationships form the knowledge graph:
 -- Document -> Drawing -> Element -> Quantity -> Rate -> BOQ Line
@@ -81,6 +89,8 @@ CREATE TABLE IF NOT EXISTS assumptions (
 CREATE TABLE IF NOT EXISTS quantity_claims (
     claim_id     TEXT PRIMARY KEY,
     project_id   INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    ingest_key   TEXT,   -- sha256(file_hash|sheet|row_index|col_header); NULL for manual
+                         -- Uniqueness enforced by ux_claims_ingest_key (partial, WHERE NOT NULL)
     description  TEXT NOT NULL,
     value        REAL NOT NULL,
     unit         TEXT NOT NULL,
@@ -91,6 +101,7 @@ CREATE TABLE IF NOT EXISTS quantity_claims (
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     CHECK (json_array_length(evidence) >= 1)
 );
+-- Note: ux_claims_ingest_key is expressly created in db.py _apply_column_migrations() 
 
 CREATE TABLE IF NOT EXISTS tool_runs (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,

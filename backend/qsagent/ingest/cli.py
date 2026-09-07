@@ -2,12 +2,25 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import sys
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+
+def _ikey(*parts: str) -> str:
+    """Deterministic ingest_key: sha256 of pipe-joined parts.
+
+    sha256(file_hash | sheet | row_index)          → evidence node
+    sha256(file_hash | sheet | row_index | column)  → quantity claim
+
+    Scopes any future re-ingest to the specific source file; rows from
+    other sources (manual QS, drawing-derived) are left untouched.
+    """
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
 def _ingest_masterfile(store, project_id, masterfile):
@@ -17,8 +30,9 @@ def _ingest_masterfile(store, project_id, masterfile):
     from ..contracts import (  # noqa
         EvidenceRef, EvidenceNode, Discipline, Quantity, Unit, QuantityClaim, Assumption,
     )
-    store.conn.execute("DELETE FROM evidence_nodes WHERE project_id=?", (project_id,))
-    store.conn.execute("DELETE FROM quantity_claims WHERE project_id=?", (project_id,))
+    # NOTE: no project-wide DELETE here.  Each row carries an ingest_key so
+    # re-ingesting this source file upserts only the rows it owns.  Rows from
+    # other sources (manual QS allowances, drawing-derived quantities) survive.
 
 
     bbx_paths = list(masterfile.rglob("*.bbx")) if masterfile.is_dir() else []
@@ -44,12 +58,13 @@ def _ingest_masterfile(store, project_id, masterfile):
         media_type="application/vnd.ms-excel", discipline="CIVIL",
         title="Mudshark Results Export")
 
+    d_key = _ikey(results_wb.file_hash, "document")
     r_node_id = store.add_node(EvidenceNode(
         project_id=project_id, node_type="document", label=results_wb.file_name,
         discipline=Discipline.CIVIL,
         payload={"provenance": "machine_export", "file_hash": results_wb.file_hash,
                  "doc_id": r_doc_id},
-    ))
+    ), ingest_key=d_key)
 
     for name, xc in results_wb.cross_checks.items():
         if not xc.passed:
@@ -74,12 +89,13 @@ def _ingest_masterfile(store, project_id, masterfile):
         wbs = qr.wbs_item or WBSItem.UNKNOWN
         mat = [{"name": m.name, "values": m.values} for m in qr.materials]
 
+        n_key = _ikey(results_wb.file_hash, qr.sheet, qr.operation_group, str(qr.row_index))
         qnode = store.add_node(EvidenceNode(
             project_id=project_id, node_type="quantity",
             label=f"{wbs}: {op}", discipline=Discipline.CIVIL,
             payload={"wbs_item": wbs, "sheet": qr.sheet, "row": qr.row_index,
                      "values": qr.values, "materials": mat},
-        ))
+        ), ingest_key=n_key)
         store.link(project_id, r_node_id, qnode, "has_quantity")
 
         if CUT_COL and CUT_COL in qr.values:
@@ -94,6 +110,7 @@ def _ingest_masterfile(store, project_id, masterfile):
                 id=aid, project_id=project_id,
                 statement=(f"Bulking factor {bf_val} ({bf_key}) for '{op}'. "
                            f"Bulked {bulked:.3f} m3 -> in-situ {insitu:.3f} m3.")))
+            c_key = _ikey(results_wb.file_hash, qr.sheet, qr.operation_group, str(qr.row_index), CUT_COL)
             store.save_claim(QuantityClaim(
                 project_id=project_id, description=f"Cut (in-situ) \u2013 {wbs}: {op}",
                 quantity=Quantity(value=round(insitu, 3), unit=Unit.M3),
@@ -101,17 +118,18 @@ def _ingest_masterfile(store, project_id, masterfile):
                 evidence=[_ref(qr.sheet, qr.row_index, f"{CUT_COL}={bulked}")],
                 assumption_ids=[aid],
                 workings=[f"Bulked={bulked:.3f} / BF={bf_val} ({bf_key}) = {insitu:.3f}"],
-            ))
+            ), ingest_key=c_key)
 
     for lr in results_wb.linear_rows:
         if lr.sheet != "Trenches":
             continue
+        c_key = _ikey(results_wb.file_hash, lr.sheet, lr.label, str(lr.row_index), "Quantity(m)")
         store.save_claim(QuantityClaim(
             project_id=project_id, description=f"Trench length \u2013 {lr.label}",
             quantity=Quantity(value=round(lr.quantity_m, 3), unit=Unit.M),
             method="mudshark.ingest.trench_length",
             evidence=[_ref(lr.sheet, lr.row_index, f"Quantity(m)={lr.quantity_m}")],
-        ))
+        ), ingest_key=c_key)
 
     ts_wb = workbooks.get("Trench_Summary")
     if ts_wb:
@@ -119,19 +137,23 @@ def _ingest_masterfile(store, project_id, masterfile):
             file_name=ts_wb.file_name, file_hash=ts_wb.file_hash,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             title="Hand-prepared Trench Summary")
+        td_key = _ikey(ts_wb.file_hash, "document")
         ts_node_id = store.add_node(EvidenceNode(
             project_id=project_id, node_type="document", label=ts_wb.file_name,
             discipline=Discipline.CIVIL,
-            payload={"provenance": "hand_prepared", "doc_id": ts_id}))
+            payload={"provenance": "hand_prepared", "doc_id": ts_id}
+        ), ingest_key=td_key)
         store.link(project_id, ts_node_id, r_node_id, "derived_from")
         for w in ts_wb.warnings:
             log.warning("Trench_Summary: %s", w)
         for qr in ts_wb.quantity_rows:
+            n_key = _ikey(ts_wb.file_hash, "Trench_Summary", qr.operation_group, str(qr.row_index))
             store.add_node(EvidenceNode(
                 project_id=project_id, node_type="element",
                 label=f"TS: {qr.operation_group}", discipline=Discipline.CIVIL,
                 payload={"source": "hand_prepared", "sheet": "Trench_Summary",
-                          "row": qr.row_index, "values": qr.values}))
+                          "row": qr.row_index, "values": qr.values}
+            ), ingest_key=n_key)
 
 
 def _ingest_drawings(store, project_id, drawings_zip):

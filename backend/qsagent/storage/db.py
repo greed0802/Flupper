@@ -63,12 +63,38 @@ class QSStore:
 
     def _migrate(self) -> None:
         self.conn.executescript(SCHEMA_PATH.read_text())
+        self._apply_column_migrations()
         if self.vec_enabled:
             self.conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks USING vec0("
                 "  node_id INTEGER, embedding float[768])"
             )
         self.conn.commit()
+
+    def _apply_column_migrations(self) -> None:
+        """Add columns that were introduced after initial schema deployment.
+
+        SQLite cannot add a UNIQUE column via ALTER TABLE — the constraint must
+        be a separate index created afterwards.  This is idempotent: each step
+        checks PRAGMA table_info before running.
+        """
+        existing_nodes = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(evidence_nodes)")}
+        if "ingest_key" not in existing_nodes:
+            self.conn.execute(
+                "ALTER TABLE evidence_nodes ADD COLUMN ingest_key TEXT")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_nodes_ingest_key"
+            " ON evidence_nodes(ingest_key) WHERE ingest_key IS NOT NULL")
+
+        existing_claims = {r[1] for r in self.conn.execute(
+            "PRAGMA table_info(quantity_claims)")}
+        if "ingest_key" not in existing_claims:
+            self.conn.execute(
+                "ALTER TABLE quantity_claims ADD COLUMN ingest_key TEXT")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_claims_ingest_key"
+            " ON quantity_claims(ingest_key) WHERE ingest_key IS NOT NULL")
 
     def close(self) -> None:
         self.conn.close()
@@ -145,27 +171,73 @@ class QSStore:
         return h.hexdigest()
 
     # ----------------------------------------------------------- graph
-    def add_node(self, node: EvidenceNode) -> int:
+    def add_node(self, node: EvidenceNode, ingest_key: str | None = None) -> int:
+        """Insert or upsert an evidence node.
+
+        If *ingest_key* is supplied: attempt INSERT OR IGNORE so duplicate
+        ingest_keys are silently skipped, then UPDATE the mutable fields.
+        The SELECT at the end retrieves the stable primary key regardless of
+        whether the row was just inserted or already existed.
+
+        Rows without an ingest_key are always inserted (human/manual nodes
+        that must never be clobbered).
+        """
         ref = node.ref
-        cur = self.conn.execute(
-            "INSERT INTO evidence_nodes (project_id, node_type, label, discipline, file_hash,"
-            " drawing_no, revision, sheet, page, zone, bbox, raw_text, payload)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                node.project_id, node.node_type, node.label, node.discipline.value,
-                ref.file_hash if ref else None,
-                ref.drawing_no if ref else None,
-                ref.revision if ref else None,
-                ref.sheet if ref else None,
-                ref.page if ref else None,
-                ref.zone if ref else None,
-                _json(list(ref.bbox)) if ref and ref.bbox else None,
-                ref.raw_text if ref else None,
-                _json(node.payload),
-            ),
-        )
-        self.conn.commit()
-        return int(cur.lastrowid)
+        if ingest_key:
+            # Step 1: insert if new; ignore if duplicate ingest_key
+            self.conn.execute(
+                "INSERT OR IGNORE INTO evidence_nodes"
+                " (project_id, node_type, label, discipline, ingest_key, file_hash,"
+                "  drawing_no, revision, sheet, page, zone, bbox, raw_text, payload)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    node.project_id, node.node_type, node.label, node.discipline.value,
+                    ingest_key,
+                    ref.file_hash if ref else None,
+                    ref.drawing_no if ref else None,
+                    ref.revision if ref else None,
+                    ref.sheet if ref else None,
+                    ref.page if ref else None,
+                    ref.zone if ref else None,
+                    _json(list(ref.bbox)) if ref and ref.bbox else None,
+                    ref.raw_text if ref else None,
+                    _json(node.payload),
+                ),
+            )
+            # Step 2: update the mutable fields in case this was a re-ingest
+            self.conn.execute(
+                "UPDATE evidence_nodes SET label=?, file_hash=?, payload=?"
+                " WHERE ingest_key=?",
+                (node.label,
+                 ref.file_hash if ref else None,
+                 _json(node.payload),
+                 ingest_key),
+            )
+            self.conn.commit()
+            row = self.conn.execute(
+                "SELECT id FROM evidence_nodes WHERE ingest_key=?", (ingest_key,)
+            ).fetchone()
+            return int(row["id"])
+        else:
+            cur = self.conn.execute(
+                "INSERT INTO evidence_nodes (project_id, node_type, label, discipline, file_hash,"
+                " drawing_no, revision, sheet, page, zone, bbox, raw_text, payload)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    node.project_id, node.node_type, node.label, node.discipline.value,
+                    ref.file_hash if ref else None,
+                    ref.drawing_no if ref else None,
+                    ref.revision if ref else None,
+                    ref.sheet if ref else None,
+                    ref.page if ref else None,
+                    ref.zone if ref else None,
+                    _json(list(ref.bbox)) if ref and ref.bbox else None,
+                    ref.raw_text if ref else None,
+                    _json(node.payload),
+                ),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
 
     def link(self, project_id: int, src_id: int, dst_id: int, rel: str) -> None:
         self.conn.execute(
@@ -242,18 +314,46 @@ class QSStore:
             "SELECT * FROM assumptions WHERE project_id=? ORDER BY id", (project_id,)))
 
     # ----------------------------------------------------------- claims
-    def save_claim(self, claim: QuantityClaim) -> str:
+    def save_claim(self, claim: QuantityClaim, ingest_key: str | None = None) -> str:
+        """Persist a quantity claim.
+
+        If *ingest_key* is supplied: INSERT OR IGNORE then UPDATE, so
+        re-ingesting the same source file updates the value in place
+        without creating a duplicate or changing the claim_id primary key.
+        """
         claim_id = claim.claim_id or f"Q-{uuid.uuid4().hex[:12]}"
-        self.conn.execute(
-            "INSERT INTO quantity_claims (claim_id, project_id, description, value, unit,"
-            " method, evidence, assumptions, workings) VALUES (?,?,?,?,?,?,?,?,?)",
-            (
-                claim_id, claim.project_id, claim.description, claim.quantity.value,
-                claim.quantity.unit.value, claim.method,
-                _json([e.model_dump(mode="json") for e in claim.evidence]),
-                _json(claim.assumption_ids), _json(claim.workings),
-            ),
-        )
+        if ingest_key:
+            # Step 1: insert if new; ignore if duplicate ingest_key
+            self.conn.execute(
+                "INSERT OR IGNORE INTO quantity_claims"
+                " (claim_id, project_id, ingest_key, description, value, unit,"
+                "  method, evidence, assumptions, workings) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    claim_id, claim.project_id, ingest_key, claim.description,
+                    claim.quantity.value, claim.quantity.unit.value, claim.method,
+                    _json([e.model_dump(mode="json") for e in claim.evidence]),
+                    _json(claim.assumption_ids), _json(claim.workings),
+                ),
+            )
+            # Step 2: update mutable fields in case this was a re-ingest
+            self.conn.execute(
+                "UPDATE quantity_claims SET value=?, description=?, evidence=?, workings=?"
+                " WHERE ingest_key=?",
+                (claim.quantity.value, claim.description,
+                 _json([e.model_dump(mode="json") for e in claim.evidence]),
+                 _json(claim.workings), ingest_key),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO quantity_claims (claim_id, project_id, description, value, unit,"
+                " method, evidence, assumptions, workings) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    claim_id, claim.project_id, claim.description, claim.quantity.value,
+                    claim.quantity.unit.value, claim.method,
+                    _json([e.model_dump(mode="json") for e in claim.evidence]),
+                    _json(claim.assumption_ids), _json(claim.workings),
+                ),
+            )
         self.conn.commit()
         self.journal(claim.project_id, actor="agent", action="claim.save", subject=claim_id,
                      payload={"value": claim.quantity.value,

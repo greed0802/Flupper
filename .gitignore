@@ -43,3 +43,7 @@ probe*.json
 
 # Ad-hoc scratch/patch scripts generated during agent sessions.
 /patch*.py
+
+# Phase verification reports — generated from real measurements, not committed.
+# Regenerate with: python backend/tools/report_phase2.py
+phase2_verification_report.json
