@@ -293,8 +293,7 @@ class CheckMate:
         If X is identical to 4+ significant figures, the only consistent
         interpretation is BF = SF = 1.0 (or all columns emitted in one unified
         state). At any realistic factor (BF=1.25 → 0.80x, BF=1.30 → 0.770x)
-        the values would differ by 20–30%. This identity holds for the Aldi
-        Dandenong project: Reused = From Site = 336.266 m³ exactly.
+        the values would differ by 20–30%. This identity holds for the the reference project project: Reused = From Site = 336.266 m³ exactly.
         """
         state = claim.measurement_state
         findings: list[Finding] = []

@@ -138,7 +138,7 @@ class TestSuspectScales:
 class TestMeasurementStateGate:
     """Rule: measurement_state UNRESOLVED/None → WARN; conversion method + UNRESOLVED → FAIL.
 
-    Discriminating evidence that BF = SF = 1.0 on the Aldi Dandenong project
+    Discriminating evidence that BF = SF = 1.0 on the the reference project project
     (and therefore that applying any bulking factor would silently produce a
     wrong figure):
 

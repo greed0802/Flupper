@@ -26,7 +26,7 @@ def _ikey(*parts: str) -> str:
     so every ingest records which file version produced each quantity.
 
     operation_group is unique within each Mudshark volume sheet (confirmed:
-    Aldi project has 4 OL=1 groups across 3 sheets; each (sheet, group) pair
+    the reference project project has 4 OL=1 groups across 3 sheets; each (sheet, group) pair
     appears exactly once).  row_index is therefore not needed and is omitted —
     including it would make the key sensitive to rows inserted above in
     re-exports, which is exactly the instability this key is designed to prevent.

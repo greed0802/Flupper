@@ -1,19 +1,22 @@
 import pytest
+import os
 from pathlib import Path
 from qsagent.storage.db import QSStore
 from qsagent.ingest.cli import _ingest_masterfile
 from qsagent.ingest.mudshark import MudsharkSource
 
-REAL_ALDI = (Path(__file__).parent.parent.parent
-             / "masterfile" / "2026" / "August" / "Aldi Dandenong")
+# Path to a real Mudshark export, supplied via env var so no client or project
+# name is committed. Set FLUPPER_REAL_PROJECT to a masterfile project directory.
+_env = os.environ.get("FLUPPER_REAL_PROJECT", "")
+REAL_PROJECT = Path(_env) if _env else Path("/nonexistent")
 
 
-@pytest.mark.skipif(not REAL_ALDI.exists(), reason="Real client data not available")
+@pytest.mark.skipif(not REAL_PROJECT.exists(), reason="Real data unavailable; set FLUPPER_REAL_PROJECT")
 def test_real_project_ingest_and_aggregation(tmp_path):
     """4c + 4d: real project structural counts and per-column aggregation checks."""
     store = QSStore(tmp_path / "real.db")
-    project_id = store.get_or_create_project("Aldi Dandenong")
-    _ingest_masterfile(store, project_id, REAL_ALDI)
+    project_id = store.get_or_create_project("Real Project Validation")
+    _ingest_masterfile(store, project_id, REAL_PROJECT)
 
     claims     = store.conn.execute("SELECT COUNT(*) FROM quantity_claims").fetchone()[0]
     assumptions = store.conn.execute("SELECT COUNT(*) FROM assumptions").fetchone()[0]
@@ -30,7 +33,7 @@ def test_real_project_ingest_and_aggregation(tmp_path):
     assert node_dict.get("quantity", 0) > 0
 
     # 4d: per-column cross-checks across all measurement columns
-    with MudsharkSource(REAL_ALDI) as src:
+    with MudsharkSource(REAL_PROJECT) as src:
         workbooks = src.parse_all()
     results = workbooks["Results"]
 
