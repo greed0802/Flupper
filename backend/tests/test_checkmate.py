@@ -238,3 +238,117 @@ class TestMeasurementStateGate:
         report = CheckMate().verify_run(run, claims=[c])
         assert any(f.rule == "quantity.measurement_state" for f in report.findings), (
             "verify_run must surface measurement_state warnings from claims")
+
+    def test_real_ingest_method_cut_raw_unresolved_warns_not_fails(self):
+        """Real ingest method 'mudshark.ingest.cut_raw_unresolved' + UNRESOLVED → WARN + PASSES.
+
+        This is the safe path: storing raw unconverted values marked UNRESOLVED.
+        The gate must warn (flagging uncertainty) but pass (allowing the claim).
+        Rejecting this path would block every bulk cut until BBX parser exists.
+        """
+        c = claim(
+            measurement_state="UNRESOLVED",
+            method="mudshark.ingest.cut_raw_unresolved",
+            description="Cut (Bulked) – BUILDING PAD",
+        )
+        report = CheckMate().verify_claim(c)
+        # Must have measurement_state warning
+        assert any(
+            f.rule == "quantity.measurement_state" and f.severity is Severity.WARN
+            for f in report.findings
+        ), "Expected WARN for UNRESOLVED state"
+        # Must NOT fail
+        assert not any(f.severity is Severity.FAIL for f in report.findings), (
+            f"cut_raw_unresolved is NOT a conversion; must not FAIL. Got: {report.findings}"
+        )
+        assert report.passed, "Gate must pass for unconverted raw storage"
+        assert report.badge() == "VERIFIED (with notes)"
+
+    def test_real_ingest_method_trench_length_unresolved_passes(self):
+        """Linear measurement method + UNRESOLVED → WARN + PASSES."""
+        c = claim(
+            measurement_state="UNRESOLVED",
+            method="mudshark.ingest.trench_length",
+            description="Trench T-01 length",
+            quantity=Quantity(value=45.2, unit=Unit.M),
+        )
+        report = CheckMate().verify_claim(c)
+        assert report.passed
+        # May have measurement_state warning, but must not FAIL
+        assert not any(f.severity is Severity.FAIL for f in report.findings)
+
+
+class TestIngestE2E:
+    """End-to-end integration: real ingest output must pass CheckMate gate.
+
+    This closes the abstract-vs-real gap. If a future change to
+    _CONVERSION_METHOD_PATTERNS causes the ingest output to be rejected,
+    this test fails immediately.
+    """
+
+    def test_no_ingested_claim_is_rejected_by_checkmate(self, tmp_path):
+        """Run ingest on real Mudshark export; assert all claims pass CheckMate.
+        
+        This closes the abstract-vs-real gap. If a future change to
+        _CONVERSION_METHOD_PATTERNS breaks the ingest output, this fails immediately.
+        """
+        from pathlib import Path
+        from qsagent.storage.db import QSStore
+        from qsagent.ingest.cli import _ingest_masterfile
+
+        fixture_dir = Path(__file__).parent / "fixtures" / "master"
+        if not fixture_dir.exists():
+            pytest.skip(f"Fixture {fixture_dir} not found")
+
+        store = QSStore(tmp_path / "test_e2e.db")
+        project_id = store.get_or_create_project("E2E CheckMate Test")
+
+        # Ingest
+        _ingest_masterfile(store, project_id, fixture_dir)
+
+        # Retrieve all claims
+        rows = store.conn.execute(
+            """
+            SELECT claim_id, description, value, unit,
+                   measurement_state, method
+            FROM quantity_claims WHERE project_id = ?
+            """,
+            (project_id,),
+        ).fetchall()
+
+        assert len(rows) > 0, "No claims found in DB after ingest"
+
+        # Build minimal QuantityClaim objects and verify each
+        from qsagent.contracts.evidence import QuantityClaim, Quantity, Unit, EvidenceRef
+
+        ref = EvidenceRef(
+            file_name="test_export.csv",
+            file_hash="0" * 64,
+            sheet="BULK CUT & FILL",
+            raw_text="(synthetic test evidence)",
+        )
+
+        rejected = []
+        for row in rows:
+            c = QuantityClaim(
+                claim_id=row[0],
+                project_id=project_id,
+                description=row[1],
+                quantity=Quantity(value=row[2], unit=Unit(row[3])),
+                measurement_state=row[4],
+                method=row[5],
+                evidence=[ref],
+            )
+            report = CheckMate().verify_claim(c)
+            if not report.passed:
+                rejected.append((c.description, c.method, report.badge(), report.findings))
+
+        if rejected:
+            msg = "CheckMate rejected claims from real ingest:\n"
+            for desc, method, badge, findings in rejected:
+                msg += f"\n  {desc} [{method}] → {badge}\n"
+                for f in findings:
+                    if f.severity is Severity.FAIL:
+                        msg += f"    [FAIL] {f.rule}: {f.message}\n"
+            pytest.fail(msg)
+

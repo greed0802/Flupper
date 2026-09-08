@@ -261,7 +261,6 @@ class CheckMate:
     _CONVERSION_METHOD_PATTERNS: tuple[str, ...] = (
         "bulked_to_insitu",
         "cut_bulked_to_insitu",
-        "cut_raw_unresolved",
         "_to_insitu",
         "volume_conversion",
         "state_convert",
