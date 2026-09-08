@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from backend.qsagent.storage.db import QSStore
 from backend.qsagent.ingest.cli import _ingest_masterfile
@@ -14,15 +15,15 @@ def generate_report():
         "all_strata_aggregation": {"aggregation_status": "UNRESOLVED", "crosscheck": "UNRESOLVED"}
     }
     
-    # Try real Aldi project
-    aldi_path = Path("masterfile/2026/August/Aldi Dandenong")
-    if aldi_path.exists():
+    # Try real the reference project project
+    real_project_path = Path(os.environ.get("FLUPPER_REAL_PROJECT", ""))
+    if real_project_path.exists():
         report["real_project_validation"]["status"] = "PASS"
         
         # Measure real project counts
         store = QSStore(":memory:")
-        pid = store.get_or_create_project("Aldi")
-        _ingest_masterfile(store, pid, aldi_path)
+        pid = store.get_or_create_project("the reference project")
+        _ingest_masterfile(store, pid, real_project_path)
         
         n = store.conn.execute("SELECT node_type, COUNT(*) as c FROM evidence_nodes GROUP BY node_type").fetchall()
         c = store.conn.execute("SELECT COUNT(*) FROM quantity_claims").fetchone()[0]
@@ -35,7 +36,7 @@ def generate_report():
         report["real_project_counts"]["journal"] = j
         
         # Measure All Strata aggregation
-        with MudsharkSource(aldi_path) as src:
+        with MudsharkSource(real_project_path) as src:
             wbs = src.parse_all()
         results = wbs["Results"]
         xc = results.cross_checks.get("All_Strata_vs_components")
