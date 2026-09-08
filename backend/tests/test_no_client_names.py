@@ -30,7 +30,13 @@ def _tracked_files() -> list[Path]:
     )
     if out.returncode != 0:
         pytest.skip("git not available")
-    return [REPO / line for line in out.stdout.split() if line]
+    # Exclude this guard itself: it necessarily contains the forbidden pattern.
+    self_rel = Path(__file__).resolve().relative_to(REPO).as_posix()
+    return [
+        REPO / line
+        for line in out.stdout.split()
+        if line and line != self_rel
+    ]
 
 
 def test_no_client_names_in_tracked_source():
