@@ -74,7 +74,7 @@ def test_migration_adds_ingest_key_to_existing_db(tmp_path):
     # ── 4. perform a real upsert to prove it works end-to-end ─────────────
     from qsagent.ingest.cli import _ingest_masterfile
     project_id = store.get_or_create_project("Test Migration")
-    masterfile_dir = Path("tests/fixtures/master")
+    masterfile_dir = Path(__file__).parent / "fixtures" / "master"
     _ingest_masterfile(store, project_id, masterfile_dir)
 
     c1 = store.conn.execute("SELECT COUNT(*) FROM quantity_claims").fetchone()[0]

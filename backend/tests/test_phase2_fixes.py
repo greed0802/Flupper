@@ -7,13 +7,15 @@ from qsagent.ingest.mudshark import _xcheck, CrossCheckResult
 from qsagent.ingest.wbs import bulked_to_insitu
 from qsagent.contracts import EvidenceNode, Discipline
 
+FIXTURES = Path(__file__).parent / "fixtures"
+
 
 # ── Scenario A: byte-identical re-ingest ─────────────────────────────────────
 def test_idempotence(tmp_path):
     """Same file, same content — counts and sums must not change."""
     store = QSStore(tmp_path / "test.db")
     project_id = store.get_or_create_project("Test Project")
-    masterfile_dir = Path("tests/fixtures/master")
+    masterfile_dir = FIXTURES / "master"
 
     _ingest_masterfile(store, project_id, masterfile_dir)
     n1 = store.conn.execute("SELECT COUNT(*) FROM evidence_nodes").fetchone()[0]
@@ -31,7 +33,6 @@ def test_idempotence(tmp_path):
     assert n1 == n2, f"Nodes changed: {n1} -> {n2}"
     assert c1 == c2, f"Claims changed: {c1} -> {c2}"
     assert sum1 == sum2, f"Sums changed: {sum1} -> {sum2}"
-
 
 
 
@@ -100,19 +101,31 @@ def test_union_reconciliation_logic():
     assert "PASS" in xc_pass.message
 
 
-# ── Item 4b: Bulked -> in-situ: division not multiplication ──────────────────
+# ── Item 4b: Cut claim stored with UNRESOLVED measurement state ───────────────
 def test_bulked_to_insitu(tmp_path):
+    """bulked_to_insitu computes correctly; ingest stores raw cut with UNRESOLVED state."""
     q, bf = 100.0, 1.25
     insitu = bulked_to_insitu(q, bf)
     assert insitu == q / bf, f"Expected division: {q}/{bf}={q/bf}, got {insitu}"
 
     store = QSStore(tmp_path / "test.db")
     project_id = store.get_or_create_project("Test Project")
-    _ingest_masterfile(store, project_id, Path("tests/fixtures/master"))
+    _ingest_masterfile(store, project_id, FIXTURES / "master")
 
+    # Assumption must mention UNRESOLVED state and raw value
     asms = store.conn.execute("SELECT * FROM assumptions").fetchall()
     assert len(asms) > 0
     a = asms[0]
-    assert "Bulking factor" in a["statement"]
-    assert "-> in-situ" in a["statement"]
+    assert "UNRESOLVED" in a["statement"]
+    assert "Raw value" in a["statement"]
     assert a["status"] == "ASSUMED"
+
+    # Claim must carry measurement_state = UNRESOLVED
+    claims = store.conn.execute(
+        "SELECT measurement_state, method FROM quantity_claims"
+        " WHERE method='mudshark.ingest.cut_raw_unresolved'"
+    ).fetchall()
+    assert len(claims) > 0, "No cut claims produced by fixture ingest"
+    assert all(c["measurement_state"] == "UNRESOLVED" for c in claims), (
+        f"Expected all UNRESOLVED, got: {[c['measurement_state'] for c in claims]}"
+    )

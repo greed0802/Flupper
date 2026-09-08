@@ -130,27 +130,40 @@ def _ingest_masterfile(store, project_id, masterfile):
         store.link(project_id, r_node_id, qnode, "has_quantity")
 
         if CUT_COL and CUT_COL in qr.values:
-            bulked = qr.values[CUT_COL]
+            cut_val = qr.values[CUT_COL]
+            # ── Measurement-state resolution ──────────────────────────────────
+            # Mudshark column headers are role labels ('Cut (Bulked m³)' etc.)
+            # but the emitted figures may all be in one unified state (e.g.
+            # in-situ) if the project's BF/SF are both 1.0.  Until the project
+            # settings file is parsed and the factors confirmed to be != 1.0,
+            # applying a bulking-factor conversion would produce a wrong result.
+            # The claim is therefore tagged UNRESOLVED and the raw column value
+            # is stored without conversion.  A later resolution step will apply
+            # the correct factor once BF is confirmed from the BBX project file.
             bf_val, bf_key = (1.25, "general")
             for m in qr.materials:
                 bf_val, bf_key = infer_bulking_factor(m.name)
                 break
-            insitu = bulked_to_insitu(bulked, bf_val)
             aid = store.next_assumption_id(project_id)
             store.upsert_assumption(Assumption(
                 id=aid, project_id=project_id,
-                statement=(f"Bulking factor {bf_val} ({bf_key}) for '{op}'. "
-                           f"Bulked {bulked:.3f} m3 -> in-situ {insitu:.3f} m3.")))
+                statement=(f"Measurement state of Cut column for '{op}' is UNRESOLVED. "
+                           f"Nominal BF={bf_val} ({bf_key}) from material; not applied until "
+                           f"project BF/SF settings confirmed from BBX. "
+                           f"Raw value={cut_val:.3f} m3 (column: {CUT_COL}).")))
             c_key = _ikey(str(project_id), "mudshark.results", qr.sheet, qr.operation_group,
                           str(qr.occurrence), CUT_COL)
-            _guard(c_key, round(insitu, 3))
+            _guard(c_key, round(cut_val, 3))
             store.save_claim(QuantityClaim(
-                project_id=project_id, description=f"Cut (in-situ) \u2013 {wbs}: {op}",
-                quantity=Quantity(value=round(insitu, 3), unit=Unit.M3),
-                method="mudshark.ingest.cut_bulked_to_insitu",
-                evidence=[_ref(qr.sheet, qr.row_index, f"{CUT_COL}={bulked}")],
+                project_id=project_id,
+                description=f"Cut volume \u2013 {wbs}: {op} [state UNRESOLVED]",
+                quantity=Quantity(value=round(cut_val, 3), unit=Unit.M3),
+                measurement_state="UNRESOLVED",
+                method="mudshark.ingest.cut_raw_unresolved",
+                evidence=[_ref(qr.sheet, qr.row_index, f"{CUT_COL}={cut_val}")],
                 assumption_ids=[aid],
-                workings=[f"Bulked={bulked:.3f} / BF={bf_val} ({bf_key}) = {insitu:.3f}"],
+                workings=[f"Raw={cut_val:.3f} m3; BF={bf_val} ({bf_key}) NOT APPLIED"
+                          f" — state UNRESOLVED pending BBX project settings."],
             ), ingest_key=c_key)
 
     for lr in results_wb.linear_rows:

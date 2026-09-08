@@ -92,6 +92,9 @@ class QSStore:
         if "ingest_key" not in existing_claims:
             self.conn.execute(
                 "ALTER TABLE quantity_claims ADD COLUMN ingest_key TEXT")
+        if "measurement_state" not in existing_claims:
+            self.conn.execute(
+                "ALTER TABLE quantity_claims ADD COLUMN measurement_state TEXT")
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ux_claims_ingest_key"
             " ON quantity_claims(ingest_key) WHERE ingest_key IS NOT NULL")
@@ -346,10 +349,13 @@ class QSStore:
                 self.conn.execute(
                     "INSERT INTO quantity_claims"
                     " (claim_id, project_id, ingest_key, description, value, unit,"
-                    "  method, evidence, assumptions, workings) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "  measurement_state, method, evidence, assumptions, workings)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         claim_id, claim.project_id, ingest_key, claim.description,
-                        claim.quantity.value, claim.quantity.unit.value, claim.method,
+                        claim.quantity.value, claim.quantity.unit.value,
+                        claim.measurement_state,
+                        claim.method,
                         evidence_json, _json(claim.assumption_ids), workings_json,
                     ),
                 )
@@ -359,9 +365,11 @@ class QSStore:
                 # Unique-key collision: row exists — update mutable fields
                 self.conn.execute(
                     "UPDATE quantity_claims"
-                    " SET value=?, description=?, evidence=?, workings=?"
+                    " SET value=?, description=?, measurement_state=?,"
+                    "     evidence=?, workings=?"
                     " WHERE ingest_key=?",
                     (claim.quantity.value, claim.description,
+                     claim.measurement_state,
                      evidence_json, workings_json, ingest_key),
                 )
                 # Fetch existing claim_id so the journal entry is consistent
@@ -372,10 +380,11 @@ class QSStore:
         else:
             self.conn.execute(
                 "INSERT INTO quantity_claims (claim_id, project_id, description, value, unit,"
-                " method, evidence, assumptions, workings) VALUES (?,?,?,?,?,?,?,?,?)",
+                " measurement_state, method, evidence, assumptions, workings)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     claim_id, claim.project_id, claim.description, claim.quantity.value,
-                    claim.quantity.unit.value, claim.method,
+                    claim.quantity.unit.value, claim.measurement_state, claim.method,
                     evidence_json, _json(claim.assumption_ids), workings_json,
                 ),
             )

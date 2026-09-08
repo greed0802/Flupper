@@ -183,6 +183,14 @@ class QuantityClaim(BaseModel):
     project_id: int
     description: str = Field(..., min_length=3)
     quantity: Quantity
+    measurement_state: Optional[str] = Field(
+        None,
+        description=(
+            "Measurement state of the quantity value: 'bulked', 'banked', "
+            "'compressed', 'm3_insitu', or 'UNRESOLVED' when the input "
+            "state cannot be confirmed from project settings."
+        ),
+    )
     method: str = Field(..., description="Tool id or calculation method used.")
     evidence: list[EvidenceRef] = Field(..., min_length=1)
     assumption_ids: list[str] = Field(default_factory=list)
