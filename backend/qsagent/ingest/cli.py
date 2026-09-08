@@ -12,13 +12,24 @@ log = logging.getLogger(__name__)
 
 
 def _ikey(*parts: str) -> str:
-    """Deterministic ingest_key: sha256 of pipe-joined parts.
+    """Deterministic ingest_key: sha256 of pipe-joined logical parts.
 
-    sha256(file_hash | sheet | row_index)          → evidence node
-    sha256(file_hash | sheet | row_index | column)  → quantity claim
+    The key must identify the LOGICAL ENTITY, not the file instance, so that
+    a corrected Mudshark re-export (different file_hash, same model content)
+    updates rows in place rather than orphaning old rows and inserting duplicates.
 
-    Scopes any future re-ingest to the specific source file; rows from
-    other sources (manual QS, drawing-derived) are left untouched.
+    Key composition:
+        evidence node:    project_id | report_type | sheet | operation_group
+        quantity claim:   project_id | report_type | sheet | operation_group | col_header
+
+    file_hash is NOT in the key.  It is stored on the EvidenceRef as provenance
+    so every ingest records which file version produced each quantity.
+
+    operation_group is unique within each Mudshark volume sheet (confirmed:
+    Aldi project has 4 OL=1 groups across 3 sheets; each (sheet, group) pair
+    appears exactly once).  row_index is therefore not needed and is omitted —
+    including it would make the key sensitive to rows inserted above in
+    re-exports, which is exactly the instability this key is designed to prevent.
     """
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
@@ -58,7 +69,7 @@ def _ingest_masterfile(store, project_id, masterfile):
         media_type="application/vnd.ms-excel", discipline="CIVIL",
         title="Mudshark Results Export")
 
-    d_key = _ikey(results_wb.file_hash, "document")
+    d_key = _ikey(str(project_id), "mudshark.results", "document")
     r_node_id = store.add_node(EvidenceNode(
         project_id=project_id, node_type="document", label=results_wb.file_name,
         discipline=Discipline.CIVIL,
@@ -84,12 +95,32 @@ def _ingest_masterfile(store, project_id, masterfile):
     FILL_COL = next((h for h in all_headers if "Fill (Compressed"   in h), None)
     IMP_COL  = next((h for h in all_headers if "Imported (Banked"   in h), None)
 
+    # Collision guard: within a single ingest run, two distinct rows must not
+    # produce the same ingest_key with different values.  If they do, the
+    # occurrence ordinal has failed to disambiguate them — raise immediately
+    # rather than silently overwriting one with the other.
+    _seen_claim_keys: dict[str, float] = {}   # key -> value from this run
+
+    def _guard(key: str, value: float) -> None:
+        if key in _seen_claim_keys:
+            prev = _seen_claim_keys[key]
+            if abs(prev - value) > 1e-9:
+                raise ValueError(
+                    f"ingest_key collision within run: key={key!r} "
+                    f"first_value={prev} second_value={value}. "
+                    f"Two rows with the same (sheet, operation_group, occurrence) "
+                    f"produced different quantities — the occurrence ordinal is "
+                    f"insufficient to disambiguate them."
+                )
+        _seen_claim_keys[key] = value
+
     for qr in results_wb.quantity_rows:
         op  = qr.operation_group
         wbs = qr.wbs_item or WBSItem.UNKNOWN
         mat = [{"name": m.name, "values": m.values} for m in qr.materials]
 
-        n_key = _ikey(results_wb.file_hash, qr.sheet, qr.operation_group, str(qr.row_index))
+        n_key = _ikey(str(project_id), "mudshark.results", qr.sheet, qr.operation_group,
+                      str(qr.occurrence))
         qnode = store.add_node(EvidenceNode(
             project_id=project_id, node_type="quantity",
             label=f"{wbs}: {op}", discipline=Discipline.CIVIL,
@@ -110,7 +141,9 @@ def _ingest_masterfile(store, project_id, masterfile):
                 id=aid, project_id=project_id,
                 statement=(f"Bulking factor {bf_val} ({bf_key}) for '{op}'. "
                            f"Bulked {bulked:.3f} m3 -> in-situ {insitu:.3f} m3.")))
-            c_key = _ikey(results_wb.file_hash, qr.sheet, qr.operation_group, str(qr.row_index), CUT_COL)
+            c_key = _ikey(str(project_id), "mudshark.results", qr.sheet, qr.operation_group,
+                          str(qr.occurrence), CUT_COL)
+            _guard(c_key, round(insitu, 3))
             store.save_claim(QuantityClaim(
                 project_id=project_id, description=f"Cut (in-situ) \u2013 {wbs}: {op}",
                 quantity=Quantity(value=round(insitu, 3), unit=Unit.M3),
@@ -123,7 +156,7 @@ def _ingest_masterfile(store, project_id, masterfile):
     for lr in results_wb.linear_rows:
         if lr.sheet != "Trenches":
             continue
-        c_key = _ikey(results_wb.file_hash, lr.sheet, lr.label, str(lr.row_index), "Quantity(m)")
+        c_key = _ikey(str(project_id), "mudshark.results", lr.sheet, lr.label, "Quantity(m)")
         store.save_claim(QuantityClaim(
             project_id=project_id, description=f"Trench length \u2013 {lr.label}",
             quantity=Quantity(value=round(lr.quantity_m, 3), unit=Unit.M),
@@ -137,7 +170,7 @@ def _ingest_masterfile(store, project_id, masterfile):
             file_name=ts_wb.file_name, file_hash=ts_wb.file_hash,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             title="Hand-prepared Trench Summary")
-        td_key = _ikey(ts_wb.file_hash, "document")
+        td_key = _ikey(str(project_id), "mudshark.trench_summary", "document")
         ts_node_id = store.add_node(EvidenceNode(
             project_id=project_id, node_type="document", label=ts_wb.file_name,
             discipline=Discipline.CIVIL,
@@ -147,7 +180,7 @@ def _ingest_masterfile(store, project_id, masterfile):
         for w in ts_wb.warnings:
             log.warning("Trench_Summary: %s", w)
         for qr in ts_wb.quantity_rows:
-            n_key = _ikey(ts_wb.file_hash, "Trench_Summary", qr.operation_group, str(qr.row_index))
+            n_key = _ikey(str(project_id), "mudshark.trench_summary", "trench_summary", qr.operation_group)
             store.add_node(EvidenceNode(
                 project_id=project_id, node_type="element",
                 label=f"TS: {qr.operation_group}", discipline=Discipline.CIVIL,

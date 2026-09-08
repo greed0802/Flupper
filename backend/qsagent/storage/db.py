@@ -174,50 +174,62 @@ class QSStore:
     def add_node(self, node: EvidenceNode, ingest_key: str | None = None) -> int:
         """Insert or upsert an evidence node.
 
-        If *ingest_key* is supplied: attempt INSERT OR IGNORE so duplicate
-        ingest_keys are silently skipped, then UPDATE the mutable fields.
-        The SELECT at the end retrieves the stable primary key regardless of
-        whether the row was just inserted or already existed.
+        If *ingest_key* is supplied: attempt a plain INSERT.  If it fails with
+        an IntegrityError caused by the ux_nodes_ingest_key unique index, the
+        key already exists — UPDATE mutable fields and return the existing id.
+
+        Any other IntegrityError (NOT NULL, FOREIGN KEY, CHECK) propagates
+        immediately so malformed rows are never silently dropped.
 
         Rows without an ingest_key are always inserted (human/manual nodes
-        that must never be clobbered).
+        that must never be clobbered by a re-ingest).
         """
+        import sqlite3 as _sqlite3
         ref = node.ref
+        params_with_key = (
+            node.project_id, node.node_type, node.label, node.discipline.value,
+            ingest_key,
+            ref.file_hash if ref else None,
+            ref.drawing_no if ref else None,
+            ref.revision if ref else None,
+            ref.sheet if ref else None,
+            ref.page if ref else None,
+            ref.zone if ref else None,
+            _json(list(ref.bbox)) if ref and ref.bbox else None,
+            ref.raw_text if ref else None,
+            _json(node.payload),
+        )
         if ingest_key:
-            # Step 1: insert if new; ignore if duplicate ingest_key
-            self.conn.execute(
-                "INSERT OR IGNORE INTO evidence_nodes"
-                " (project_id, node_type, label, discipline, ingest_key, file_hash,"
-                "  drawing_no, revision, sheet, page, zone, bbox, raw_text, payload)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    node.project_id, node.node_type, node.label, node.discipline.value,
-                    ingest_key,
-                    ref.file_hash if ref else None,
-                    ref.drawing_no if ref else None,
-                    ref.revision if ref else None,
-                    ref.sheet if ref else None,
-                    ref.page if ref else None,
-                    ref.zone if ref else None,
-                    _json(list(ref.bbox)) if ref and ref.bbox else None,
-                    ref.raw_text if ref else None,
-                    _json(node.payload),
-                ),
-            )
-            # Step 2: update the mutable fields in case this was a re-ingest
-            self.conn.execute(
-                "UPDATE evidence_nodes SET label=?, file_hash=?, payload=?"
-                " WHERE ingest_key=?",
-                (node.label,
-                 ref.file_hash if ref else None,
-                 _json(node.payload),
-                 ingest_key),
-            )
-            self.conn.commit()
-            row = self.conn.execute(
-                "SELECT id FROM evidence_nodes WHERE ingest_key=?", (ingest_key,)
-            ).fetchone()
-            return int(row["id"])
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO evidence_nodes"
+                    " (project_id, node_type, label, discipline, ingest_key, file_hash,"
+                    "  drawing_no, revision, sheet, page, zone, bbox, raw_text, payload)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                    " RETURNING id",
+                    params_with_key,
+                )
+                new_id = int(cur.fetchone()[0])   # consume cursor BEFORE commit
+                self.conn.commit()
+                return new_id
+            except _sqlite3.IntegrityError as exc:
+                if "ux_nodes_ingest_key" not in str(exc) and "UNIQUE" not in str(exc):
+                    raise  # NOT NULL / FK / CHECK — propagate loudly
+                # Unique-key collision: row exists — update mutable fields
+                self.conn.execute(
+                    "UPDATE evidence_nodes"
+                    " SET label=?, file_hash=?, payload=?"
+                    " WHERE ingest_key=?",
+                    (node.label,
+                     ref.file_hash if ref else None,
+                     _json(node.payload),
+                     ingest_key),
+                )
+                self.conn.commit()
+                row = self.conn.execute(
+                    "SELECT id FROM evidence_nodes WHERE ingest_key=?", (ingest_key,)
+                ).fetchone()
+                return int(row["id"])
         else:
             cur = self.conn.execute(
                 "INSERT INTO evidence_nodes (project_id, node_type, label, discipline, file_hash,"
@@ -238,6 +250,7 @@ class QSStore:
             )
             self.conn.commit()
             return int(cur.lastrowid)
+
 
     def link(self, project_id: int, src_id: int, dst_id: int, rel: str) -> None:
         self.conn.execute(
@@ -317,32 +330,45 @@ class QSStore:
     def save_claim(self, claim: QuantityClaim, ingest_key: str | None = None) -> str:
         """Persist a quantity claim.
 
-        If *ingest_key* is supplied: INSERT OR IGNORE then UPDATE, so
-        re-ingesting the same source file updates the value in place
-        without creating a duplicate or changing the claim_id primary key.
+        If *ingest_key* is supplied: attempt a plain INSERT.  On a unique-key
+        conflict (ux_claims_ingest_key), UPDATE the mutable fields in place so
+        re-ingesting a corrected Mudshark export updates rather than duplicates.
+
+        Any other IntegrityError (NOT NULL, FK, CHECK) propagates immediately —
+        a malformed row must fail loudly, not disappear silently.
         """
+        import sqlite3 as _sqlite3
         claim_id = claim.claim_id or f"Q-{uuid.uuid4().hex[:12]}"
+        evidence_json = _json([e.model_dump(mode="json") for e in claim.evidence])
+        workings_json = _json(claim.workings)
         if ingest_key:
-            # Step 1: insert if new; ignore if duplicate ingest_key
-            self.conn.execute(
-                "INSERT OR IGNORE INTO quantity_claims"
-                " (claim_id, project_id, ingest_key, description, value, unit,"
-                "  method, evidence, assumptions, workings) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (
-                    claim_id, claim.project_id, ingest_key, claim.description,
-                    claim.quantity.value, claim.quantity.unit.value, claim.method,
-                    _json([e.model_dump(mode="json") for e in claim.evidence]),
-                    _json(claim.assumption_ids), _json(claim.workings),
-                ),
-            )
-            # Step 2: update mutable fields in case this was a re-ingest
-            self.conn.execute(
-                "UPDATE quantity_claims SET value=?, description=?, evidence=?, workings=?"
-                " WHERE ingest_key=?",
-                (claim.quantity.value, claim.description,
-                 _json([e.model_dump(mode="json") for e in claim.evidence]),
-                 _json(claim.workings), ingest_key),
-            )
+            try:
+                self.conn.execute(
+                    "INSERT INTO quantity_claims"
+                    " (claim_id, project_id, ingest_key, description, value, unit,"
+                    "  method, evidence, assumptions, workings) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        claim_id, claim.project_id, ingest_key, claim.description,
+                        claim.quantity.value, claim.quantity.unit.value, claim.method,
+                        evidence_json, _json(claim.assumption_ids), workings_json,
+                    ),
+                )
+            except _sqlite3.IntegrityError as exc:
+                if "ux_claims_ingest_key" not in str(exc) and "UNIQUE" not in str(exc):
+                    raise  # NOT NULL / FK / CHECK — propagate loudly
+                # Unique-key collision: row exists — update mutable fields
+                self.conn.execute(
+                    "UPDATE quantity_claims"
+                    " SET value=?, description=?, evidence=?, workings=?"
+                    " WHERE ingest_key=?",
+                    (claim.quantity.value, claim.description,
+                     evidence_json, workings_json, ingest_key),
+                )
+                # Fetch existing claim_id so the journal entry is consistent
+                row = self.conn.execute(
+                    "SELECT claim_id FROM quantity_claims WHERE ingest_key=?", (ingest_key,)
+                ).fetchone()
+                claim_id = row["claim_id"]
         else:
             self.conn.execute(
                 "INSERT INTO quantity_claims (claim_id, project_id, description, value, unit,"
@@ -350,8 +376,7 @@ class QSStore:
                 (
                     claim_id, claim.project_id, claim.description, claim.quantity.value,
                     claim.quantity.unit.value, claim.method,
-                    _json([e.model_dump(mode="json") for e in claim.evidence]),
-                    _json(claim.assumption_ids), _json(claim.workings),
+                    evidence_json, _json(claim.assumption_ids), workings_json,
                 ),
             )
         self.conn.commit()

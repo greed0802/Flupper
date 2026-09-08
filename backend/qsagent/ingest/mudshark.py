@@ -70,7 +70,16 @@ class MaterialRow:
 
 @dataclass
 class QuantityRow:
-    """OL-1 operation-group leaf from a volume sheet."""
+    """OL-1 operation-group leaf from a volume sheet.
+
+    ``occurrence`` is a 1-based ordinal counting how many times the same
+    (sheet, operation_group) label has appeared so far in sheet-scan order.
+    It makes the ingest_key stable even when two OL-1 rows share the same
+    label (empty string, "Strata", or genuinely repeated group names).
+    Inserting an unrelated row above does not change the ordinal of rows
+    below it, provided the relative ordering of same-label siblings is
+    preserved — which Mudshark re-exports always do.
+    """
     sheet: str
     row_index: int
     operation_group: str
@@ -78,6 +87,7 @@ class QuantityRow:
     values: dict[str, float]   # header -> value
     materials: list[MaterialRow] = field(default_factory=list)
     wbs_item: Optional[str] = None
+    occurrence: int = 1        # 1-based ordinal within (sheet, operation_group)
 
 
 @dataclass
@@ -196,12 +206,14 @@ def _xcheck(name: str, comp: float, union: float) -> CrossCheckResult:
 
 def _parse_volume_sheet(ws, sheet_name, file_name, has_format):
     if ws.nrows < 2:
-        return [], 0.0
+        return [], {}, 0.0
     headers = _map_headers(ws.row_values(0))
     numeric_cols = [c for c, (_, s) in headers.items() if s is not None]
     if not numeric_cols:
         raise ParseError(file_name, sheet_name, 0, "No recognised measurement columns")
     rows, cut_total, current_ol1 = [], 0.0, None
+    col_totals: dict[str, float] = {}   # header -> OL=0 sum (all measurement cols)
+    _occurrence: dict[str, int] = {}   # label -> count seen so far at OL=1
     for r in range(1, ws.nrows):
         ol = _ol_from_rowinfo(ws, r, has_format)
         label = str(ws.cell_value(r, 0)).strip() if ws.cell_type(r, 0) == 1 else ""
@@ -211,8 +223,11 @@ def _parse_volume_sheet(ws, sheet_name, file_name, has_format):
             continue
         if ol == 0:
             for c, (h, s) in headers.items():
-                if s == "bulked" and "Cut" in h and ws.cell_type(r, c) == 2:
-                    cut_total += float(ws.cell_value(r, c))
+                if s is not None and h and ws.cell_type(r, c) == 2:
+                    v = float(ws.cell_value(r, c))
+                    col_totals[h] = col_totals.get(h, 0.0) + v
+                    if s == "bulked" and "Cut" in h:
+                        cut_total += v
             continue
         if ol == 1:
             vals: dict[str, float] = {}
@@ -222,8 +237,10 @@ def _parse_volume_sheet(ws, sheet_name, file_name, has_format):
                 v = _read_float(ws, r, c, file_name, sheet_name)
                 if v is not None:
                     vals[h] = v
+            _occurrence[label] = _occurrence.get(label, 0) + 1
             qr = QuantityRow(sheet=sheet_name, row_index=r,
-                             operation_group=label, outline_level=ol, values=vals)
+                             operation_group=label, outline_level=ol, values=vals,
+                             occurrence=_occurrence[label])
             rows.append(qr)
             current_ol1 = qr
             continue
@@ -239,7 +256,7 @@ def _parse_volume_sheet(ws, sheet_name, file_name, has_format):
                     vals[h] = v
             if vals:
                 current_ol1.materials.append(MaterialRow(name=label, values=vals))
-    return rows, cut_total
+    return rows, col_totals, cut_total
 
 
 def _parse_trenches_sheet(ws, file_name, has_format):
@@ -308,31 +325,30 @@ def _parse_areas_sheet(ws, file_name):
     return rows
 
 
-def _parse_union_cut_total(ws, has_format):
-    """Sum the Cut (Bulked) column in the All Strata Operations union sheet.
+def _parse_union_col_totals(ws, has_format) -> dict[str, float]:
+    """Sum every recognised measurement column in the All Strata Operations sheet.
 
-    Only OL=0 rows are counted — these are the group-level totals written by
+    Only OL=0 rows are summed — these are the group-level totals written by
     Mudshark.  OL=1 (leaf) and OL=2 (material detail) rows carry the same
-    values again and must not be included or the total is multiplied by 3.
+    values again; including them multiplies the total by 3.
 
-    Matching _parse_volume_sheet, which also accumulates cut_total only from
-    OL=0 rows on the component sheets (Ground Layer, Structure, Trench Run).
+    Returns a dict mapping column-header -> OL=0 total, for every column that
+    has at least one numeric OL=0 value.
     """
     if ws.nrows < 2:
-        return 0.0
+        return {}
     headers = _map_headers(ws.row_values(0))
-    cut_col = next((c for c, (h, _) in headers.items() if "Cut (Bulked" in h), None)
-    if cut_col is None:
-        return 0.0
-    total = 0.0
+    numeric_cols = {c: h for c, (h, s) in headers.items() if s is not None and h}
+    totals: dict[str, float] = {}
     for r in range(1, ws.nrows):
-        if ws.cell_type(r, cut_col) != 2:
-            continue
         ri = ws.rowinfo_map.get(r) if has_format else None
         ol = ri.outline_level if ri else 0
-        if ol == 0:   # group-level total rows only
-            total += float(ws.cell_value(r, cut_col))
-    return total
+        if ol != 0:
+            continue
+        for c, h in numeric_cols.items():
+            if ws.cell_type(r, c) == 2:
+                totals[h] = totals.get(h, 0.0) + float(ws.cell_value(r, c))
+    return totals
 
 
 # ─── main parse entry points ──────────────────────────────────────────────────
@@ -359,19 +375,33 @@ def _parse_results_xls(data: bytes, file_name: str) -> "MudsharkWorkbook":
         wb_out.warnings.append("formatting_info=True failed; outline levels unavailable")
     sheet_names = [s.name for s in wb.sheets()]
     comp_cut = 0.0
+    # Aggregate each measurement column across all component sheets for cross-check
+    comp_col_totals: dict[str, float] = {}
     for sname in _VOLUME_SHEETS:
         if sname not in sheet_names:
             wb_out.warnings.append(f"Expected sheet '{sname}' not found in {file_name}")
             continue
         ws = wb.sheet_by_name(sname)
-        sheet_rows, sheet_cut = _parse_volume_sheet(ws, sname, file_name, has_format)
+        sheet_rows, sheet_col_totals, sheet_cut = _parse_volume_sheet(
+            ws, sname, file_name, has_format)
         wb_out.quantity_rows.extend(sheet_rows)
         comp_cut += sheet_cut
+        for h, v in sheet_col_totals.items():
+            comp_col_totals[h] = comp_col_totals.get(h, 0.0) + v
     if "All Strata Operations" in sheet_names:
         union_ws = wb.sheet_by_name("All Strata Operations")
-        union_cut = _parse_union_cut_total(union_ws, has_format)
-        wb_out.cross_checks["All_Strata_vs_components"] = _xcheck(
-            "All Strata Operations", comp_cut, union_cut)
+        union_totals = _parse_union_col_totals(union_ws, has_format)
+        # Cross-check every column present in BOTH component sheets and union sheet
+        for col_h, comp_v in comp_col_totals.items():
+            union_v = union_totals.get(col_h)
+            if union_v is None:
+                continue  # column not in union sheet — skip
+            # Derive a short safe key from the header text
+            col_key = col_h.replace(" ", "_").replace("(", "").replace(")", "").replace("/", "_")
+            xc_key = f"All_Strata_vs_components.{col_key}"
+            wb_out.cross_checks[xc_key] = _xcheck(
+                f"All Strata Operations [{col_h}]", comp_v, union_v)
+
     trench_rows: list = []
     if "Trenches" in sheet_names:
         ws = wb.sheet_by_name("Trenches")

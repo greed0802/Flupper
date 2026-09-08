@@ -4,44 +4,56 @@ from qsagent.storage.db import QSStore
 from qsagent.ingest.cli import _ingest_masterfile
 from qsagent.ingest.mudshark import MudsharkSource
 
-REAL_ALDI = Path(__file__).parent.parent.parent / "masterfile" / "2026" / "August" / "Aldi Dandenong"
+REAL_ALDI = (Path(__file__).parent.parent.parent
+             / "masterfile" / "2026" / "August" / "Aldi Dandenong")
+
 
 @pytest.mark.skipif(not REAL_ALDI.exists(), reason="Real client data not available")
 def test_real_project_ingest_and_aggregation(tmp_path):
-    # This covers 4c (Counts/structure) and 4d (Aggregation resolution)
+    """4c + 4d: real project structural counts and per-column aggregation checks."""
     store = QSStore(tmp_path / "real.db")
     project_id = store.get_or_create_project("Aldi Dandenong")
-    
     _ingest_masterfile(store, project_id, REAL_ALDI)
-    
-    metrics = {
-        "nodes": store.conn.execute("SELECT node_type, COUNT(*) as c FROM evidence_nodes GROUP BY node_type").fetchall(),
-        "claims": store.conn.execute("SELECT COUNT(*) FROM quantity_claims").fetchone()[0],
-        "assumptions": store.conn.execute("SELECT COUNT(*) FROM assumptions").fetchone()[0],
-        "journal_entries": store.conn.execute("SELECT COUNT(*) FROM audit_journal").fetchone()[0],
-    }
-    
-    # 4c: structural assertions (non-zero quantities on realistic data)
-    assert metrics["claims"] > 0
-    assert metrics["assumptions"] > 0
-    assert metrics["journal_entries"] > 0
-    node_dict = {r["node_type"]: r["c"] for r in metrics["nodes"]}
+
+    claims     = store.conn.execute("SELECT COUNT(*) FROM quantity_claims").fetchone()[0]
+    assumptions = store.conn.execute("SELECT COUNT(*) FROM assumptions").fetchone()[0]
+    journal    = store.conn.execute("SELECT COUNT(*) FROM audit_journal").fetchone()[0]
+    nodes      = store.conn.execute(
+        "SELECT node_type, COUNT(*) as c FROM evidence_nodes GROUP BY node_type"
+    ).fetchall()
+    node_dict  = {r["node_type"]: r["c"] for r in nodes}
+
+    # 4c: structural assertions
+    assert claims > 0
+    assert assumptions > 0
+    assert journal > 0
     assert node_dict.get("quantity", 0) > 0
-    
-    # 4d: Check the comparison of component vs All Strata union
+
+    # 4d: per-column cross-checks across all measurement columns
     with MudsharkSource(REAL_ALDI) as src:
         workbooks = src.parse_all()
     results = workbooks["Results"]
-    
-    xc = results.cross_checks.get("All_Strata_vs_components")
-    assert xc is not None
-    assert xc.component_total > 0
-    assert xc.union_total > 0
-    # After OL-filtering fix: All Strata OL=0 totals now match component OL=0 totals exactly.
-    # Ratio must NOT be an exact integer (which would mean the bug is back).
-    ratio = xc.union_total / xc.component_total
-    assert abs(ratio - round(ratio)) > 0 or xc.passed, (
-        f"Cross-check ratio={ratio:.6f}; if integer and failed, triple-counting bug is back"
+
+    xc_keys = [k for k in results.cross_checks if k.startswith("All_Strata_vs_components")]
+    assert len(xc_keys) > 0, "No All_Strata cross-check results produced"
+
+    # Cut (Bulked) — populated by Ground Layer; must reconcile
+    cut_keys = [k for k in xc_keys if "Cut" in k]
+    assert cut_keys, "Cut (Bulked) column not cross-checked"
+    cut_xc = results.cross_checks[cut_keys[0]]
+    assert cut_xc.passed, (
+        f"Cut reconciliation FAIL: components={cut_xc.component_total:.3f} "
+        f"union={cut_xc.union_total:.3f} rel_diff={cut_xc.rel_diff:.4%}"
     )
-    # On this project the cross-check passes after the fix
-    assert xc.passed, f"All_Strata_vs_components should PASS, got: {xc.message}"
+
+    # Fill and Imported — populated by Structure/Trench Run sheets
+    for col_fragment in ("Fill", "Imported"):
+        col_keys = [k for k in xc_keys if col_fragment in k]
+        if col_keys:
+            xc = results.cross_checks[col_keys[0]]
+            # Assert reconciliation holds for these columns too
+            assert xc.passed, (
+                f"{col_fragment} reconciliation FAIL: "
+                f"components={xc.component_total:.3f} union={xc.union_total:.3f} "
+                f"rel_diff={xc.rel_diff:.4%}"
+            )
