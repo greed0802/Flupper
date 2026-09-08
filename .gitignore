@@ -1,0 +1,49 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+.env
+*.egg-info/
+build/
+dist/
+.dart_tool/
+
+# ── Real project data must never be committed ─────────────────────────
+# See docs/DATA_ONBOARDING.md. These folders live inside the checkout on
+# the Windows workstation, so they are ignored wholesale rather than by
+# extension — a single missed pattern would leak client rates.
+/masterfile/
+/project/
+/qs-data/
+/data/
+
+# Belt and braces: never commit these anywhere in the tree.
+*.zip
+*.bbx
+*.msk
+*.xls
+*.xlsx
+*.xlsm
+*.pdf
+*.dwg
+*.dxf
+*.dgn
+
+# ...but DO allow synthetic test fixtures, which are safe by construction.
+!backend/tests/fixtures/**
+
+# Probe reports contain filenames, sheet names and client project names.
+# Match ANY probe output, not just the two names originally anticipated.
+probe*.json
+*probe*.json
+
+# Ad-hoc scratch/patch scripts generated during agent sessions.
+/patch*.py
+
+# Phase verification reports — generated from real measurements, not committed.
+# Regenerate with: python backend/tools/report_phase2.py
+phase2_verification_report.json
