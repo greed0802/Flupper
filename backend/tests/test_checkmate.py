@@ -466,16 +466,16 @@ class TestMeasurementStateGate:
 class TestIngestE2E:
     """End-to-end integration: real ingest output must pass CheckMate gate.
 
-    This closes the abstract-vs-real gap. If a future change to
-    _CONVERSION_METHOD_PATTERNS causes the ingest output to be rejected,
+    This closes the abstract-vs-real gap. If a future change to the
+    conversion gate logic causes the ingest output to be rejected,
     this test fails immediately.
     """
 
     def test_no_ingested_claim_is_rejected_by_checkmate(self, tmp_path):
         """Run ingest on real Mudshark export; assert all claims pass CheckMate.
         
-        This closes the abstract-vs-real gap. If a future change to
-        _CONVERSION_METHOD_PATTERNS breaks the ingest output, this fails immediately.
+        This closes the abstract-vs-real gap. If a future change to the
+        conversion gate logic breaks the ingest output, this fails immediately.
         """
         from pathlib import Path
         from qsagent.storage.db import QSStore
