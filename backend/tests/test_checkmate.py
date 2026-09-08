@@ -98,7 +98,8 @@ class TestGrounding:
     def test_fully_cited_claim_passes(self):
         report = CheckMate().verify_claim(claim())
         assert report.passed
-        assert "C-204" in report.findings[-1].message
+        trace = next((f for f in report.findings if f.rule == "grounding.trace"), None)
+        assert trace is not None and "C-204" in trace.message
 
     def test_missing_revision_warns(self):
         report = CheckMate().verify_claim(claim(evidence=[ref(revision=None)]))
@@ -132,3 +133,108 @@ class TestSuspectScales:
         run = REGISTRY.run("trench.volume", 1, length_m=10000, width_mm=600, depth_m=1.0)
         report = CheckMate().verify_run(run)
         assert any(f.rule == "unit.suspect_scale" for f in report.findings)
+
+
+class TestMeasurementStateGate:
+    """Rule: measurement_state UNRESOLVED/None → WARN; conversion method + UNRESOLVED → FAIL.
+
+    Discriminating evidence that BF = SF = 1.0 on the Aldi Dandenong project
+    (and therefore that applying any bulking factor would silently produce a
+    wrong figure):
+
+        Reused   (Bulked m³)      = 336.266   ← material cut on site, reused
+        From Site (Compressed m³) = 336.266   ← same material used as fill
+
+    The same physical material appears in a Bulked column on the cut side and a
+    Compressed column on the fill side, yet the values are identical to 3 d.p.
+    Testing plausible conversion factors:
+        BF=1.30, SF=0.88 → From Site = 336.266 × 0.88/1.30 = 227.626  ≠ 336.266
+        BF=1.25, SF=0.90 → From Site = 336.266 × 0.90/1.25 = 242.112  ≠ 336.266
+        BF=1.20, SF=0.90 → From Site = 336.266 × 0.90/1.20 = 252.200  ≠ 336.266
+        BF=SF=1.0        → From Site = 336.266 × 1.0/1.0   = 336.266  ✓
+
+    Only BF = SF = 1.0 is consistent. The column headers are role labels; all
+    figures are emitted in one unified state. Applying a non-unity BF produces
+    a silent 23% under-measure and an under-priced tender.
+    """
+
+    def test_unresolved_state_produces_warn_not_fail(self):
+        """UNRESOLVED alone → WARN, claim still passes gate."""
+        c = claim(measurement_state="UNRESOLVED",
+                  method="mudshark.ingest.cut_raw_unresolved")
+        report = CheckMate().verify_claim(c)
+        ms_findings = [f for f in report.findings
+                       if f.rule == "quantity.measurement_state"]
+        assert any(f.severity is Severity.WARN for f in ms_findings), (
+            "Expected WARN for UNRESOLVED state")
+
+    def test_null_state_produces_warn_not_fail(self):
+        """measurement_state=None → WARN; not every existing claim has state tagged."""
+        c = claim(measurement_state=None)
+        report = CheckMate().verify_claim(c)
+        ms_findings = [f for f in report.findings
+                       if f.rule == "quantity.measurement_state"]
+        assert any(f.severity is Severity.WARN for f in ms_findings), (
+            "Expected WARN for None state")
+        # Must not FAIL — too disruptive for legacy claims without state tag
+        assert not any(f.severity is Severity.FAIL for f in ms_findings)
+
+    def test_conversion_method_plus_unresolved_fails(self):
+        """Conversion method + UNRESOLVED → FAIL; cannot reach BOQ with VERIFIED badge."""
+        # Simulate: someone calls a conversion tool without first resolving state
+        c = claim(
+            measurement_state="UNRESOLVED",
+            method="mudshark.ingest.cut_bulked_to_insitu",
+            description="Cut (in-situ) – BUILDING PAD via bulked_to_insitu",
+        )
+        report = CheckMate().verify_claim(c)
+        fail_findings = [f for f in report.findings
+                         if f.rule == "quantity.measurement_state_conversion"
+                         and f.severity is Severity.FAIL]
+        assert fail_findings, (
+            "Conversion method with UNRESOLVED state must produce a FAIL finding")
+        assert not report.passed, "Gate must reject UNRESOLVED + conversion method"
+        assert report.badge() == "REJECTED"
+
+    def test_conversion_method_plus_null_state_fails(self):
+        """Conversion method + None state also → FAIL."""
+        c = claim(
+            measurement_state=None,
+            method="mudshark.ingest.cut_bulked_to_insitu",
+            description="Cut (in-situ) – BUILDING PAD, state untracked",
+        )
+        report = CheckMate().verify_claim(c)
+        fail_findings = [f for f in report.findings
+                         if f.rule == "quantity.measurement_state_conversion"
+                         and f.severity is Severity.FAIL]
+        assert fail_findings, "Conversion method with None state must FAIL"
+
+    def test_resolved_state_silent_on_non_conversion_method(self):
+        """Resolved state on an ordinary claim → no measurement_state findings."""
+        c = claim(measurement_state="m3_insitu")
+        report = CheckMate().verify_claim(c)
+        ms_findings = [f for f in report.findings
+                       if "measurement_state" in f.rule]
+        assert not ms_findings, (
+            f"Resolved state should produce no measurement_state findings; got {ms_findings}")
+
+    def test_resolved_state_on_conversion_method_passes(self):
+        """Confirmed state + conversion method → gate passes cleanly."""
+        c = claim(
+            measurement_state="m3_insitu",
+            method="mudshark.ingest.cut_bulked_to_insitu",
+            description="Cut (in-situ) – confirmed BF=1.0 from BBX settings",
+        )
+        report = CheckMate().verify_claim(c)
+        fail_findings = [f for f in report.findings if f.severity is Severity.FAIL]
+        assert not fail_findings, (
+            f"Resolved state + conversion method must pass; failures: {fail_findings}")
+
+    def test_unresolved_claim_in_verify_run_is_flagged(self):
+        """Unresolved claims passed to verify_run surface the state warning."""
+        run = REGISTRY.run("trench.volume", 1, length_m=10, width_mm=600, depth_m=1.0)
+        c = claim(measurement_state="UNRESOLVED",
+                  method="mudshark.ingest.cut_raw_unresolved")
+        report = CheckMate().verify_run(run, claims=[c])
+        assert any(f.rule == "quantity.measurement_state" for f in report.findings), (
+            "verify_run must surface measurement_state warnings from claims")
