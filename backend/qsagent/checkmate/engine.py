@@ -255,21 +255,6 @@ class CheckMate:
         return findings
 
     # ---------------------------------------------- measurement-state checks
-    # Conversion-method patterns: if a ToolRun's tool_id matches any of these,
-    # it is a volume-state conversion that REQUIRES a resolved measurement_state
-    # on every input claim.
-    _CONVERSION_METHOD_PATTERNS: tuple[str, ...] = (
-        "bulked_to_insitu",
-        "cut_bulked_to_insitu",
-        "_to_insitu",
-        "volume_conversion",
-        "state_convert",
-    )
-
-    @staticmethod
-    def _is_conversion_method(method: str) -> bool:
-        return any(p in method for p in CheckMate._CONVERSION_METHOD_PATTERNS)
-
     def check_measurement_state(self, claim: QuantityClaim) -> list[Finding]:
         """Gate on unknown measurement state.
 
@@ -277,10 +262,10 @@ class CheckMate:
           WARN — measurement_state is None (not tracked) or is 'UNRESOLVED'.
                  The quantity is usable for counting but must not pass through
                  a volume-state conversion without first being resolved.
-          FAIL — the claim's own method is a conversion method AND the state
-                 is still UNRESOLVED or None, meaning the conversion was applied
-                 (or skipped) without confirming what state the input was in.
-                 This is the exact scenario that produces a silent 23% error.
+          FAIL — claim.conversion_applied is True AND the state is still
+                 UNRESOLVED or None, meaning a conversion was applied without
+                 confirming what state the input was in. This is the exact
+                 scenario that produces a silent 23% error.
 
         Discriminating evidence for BF=1.0 / state-unified projects
         ────────────────────────────────────────────────────────────
@@ -319,17 +304,17 @@ class CheckMate:
                  "unit": claim.quantity.unit.value, "measurement_state": state},
             ))
 
-        # FAIL: conversion method used without a resolved state
-        if self._is_conversion_method(claim.method) and state in (None, "UNRESOLVED"):
+        # FAIL: conversion applied without a resolved state
+        if claim.conversion_applied and state in (None, "UNRESOLVED"):
             findings.append(Finding(
                 "quantity.measurement_state_conversion", Severity.FAIL,
-                f"Claim '{claim.description}' was produced by conversion method "
-                f"'{claim.method}' but measurement_state={state!r}. "
+                f"Claim '{claim.description}' has conversion_applied=True "
+                f"but measurement_state={state!r}. "
                 "A volume-state conversion without a confirmed input state "
                 "silently propagates the wrong figure. Resolve BF/SF from the "
                 "BBX project settings before applying any conversion.",
                 {"method": claim.method, "measurement_state": state,
-                 "value": claim.quantity.value},
+                 "value": claim.quantity.value, "conversion_applied": True},
             ))
 
         return findings

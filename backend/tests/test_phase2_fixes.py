@@ -53,6 +53,7 @@ def test_idempotence_scenario_b_file_hash_change(tmp_path):
             description="Cut (in-situ)",
             quantity=Quantity(value=value, unit=Unit.M3),
             method="mudshark.ingest.cut_bulked_to_insitu",
+            conversion_applied=True,
             evidence=[EvidenceRef(
                 file_hash=file_hash, file_name=f"Results_{file_hash[:8]}.xls",
                 sheet="Ground Layer Operations", raw_text="Cut",

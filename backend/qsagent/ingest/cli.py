@@ -159,6 +159,7 @@ def _ingest_masterfile(store, project_id, masterfile):
                 description=f"Cut volume \u2013 {wbs}: {op} [state UNRESOLVED]",
                 quantity=Quantity(value=round(cut_val, 3), unit=Unit.M3),
                 measurement_state="UNRESOLVED",
+                conversion_applied=False,
                 method="mudshark.ingest.cut_raw_unresolved",
                 evidence=[_ref(qr.sheet, qr.row_index, f"{CUT_COL}={cut_val}")],
                 assumption_ids=[aid],

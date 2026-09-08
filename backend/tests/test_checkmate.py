@@ -186,6 +186,7 @@ class TestMeasurementStateGate:
             measurement_state="UNRESOLVED",
             method="mudshark.ingest.cut_bulked_to_insitu",
             description="Cut (in-situ) – BUILDING PAD via bulked_to_insitu",
+            conversion_applied=True,
         )
         report = CheckMate().verify_claim(c)
         fail_findings = [f for f in report.findings
@@ -202,6 +203,7 @@ class TestMeasurementStateGate:
             measurement_state=None,
             method="mudshark.ingest.cut_bulked_to_insitu",
             description="Cut (in-situ) – BUILDING PAD, state untracked",
+            conversion_applied=True,
         )
         report = CheckMate().verify_claim(c)
         fail_findings = [f for f in report.findings
@@ -224,6 +226,7 @@ class TestMeasurementStateGate:
             measurement_state="m3_insitu",
             method="mudshark.ingest.cut_bulked_to_insitu",
             description="Cut (in-situ) – confirmed BF=1.0 from BBX settings",
+            conversion_applied=True,
         )
         report = CheckMate().verify_claim(c)
         fail_findings = [f for f in report.findings if f.severity is Severity.FAIL]
@@ -250,6 +253,7 @@ class TestMeasurementStateGate:
             measurement_state="UNRESOLVED",
             method="mudshark.ingest.cut_raw_unresolved",
             description="Cut (Bulked) – BUILDING PAD",
+            conversion_applied=False,
         )
         report = CheckMate().verify_claim(c)
         # Must have measurement_state warning
@@ -276,6 +280,187 @@ class TestMeasurementStateGate:
         assert report.passed
         # May have measurement_state warning, but must not FAIL
         assert not any(f.severity is Severity.FAIL for f in report.findings)
+
+    def test_conversion_applied_false_with_null_state_warns_not_fails(self):
+        """conversion_applied=False + None state → WARN, passes gate."""
+        c = claim(
+            measurement_state=None,
+            method="some.method.name",
+            description="Non-conversion operation, state untracked",
+            conversion_applied=False,
+            quantity=Quantity(value=35.7, unit=Unit.M3),
+        )
+        report = CheckMate().verify_claim(c)
+        assert report.passed, "Non-conversion with None state must pass"
+        warn_findings = [f for f in report.findings
+                         if f.rule == "quantity.measurement_state"
+                         and f.severity is Severity.WARN]
+        assert warn_findings, "Expected WARN for None state"
+        assert report.badge() == "VERIFIED (with notes)"
+
+    def test_conversion_applied_false_with_resolved_state_silent(self):
+        """conversion_applied=False + resolved state → no measurement_state findings."""
+        c = claim(
+            measurement_state="bulked",
+            method="mudshark.ingest.raw_storage",
+            description="Raw bulked value stored without conversion",
+            conversion_applied=False,
+            quantity=Quantity(value=150.3, unit=Unit.M3),
+        )
+        report = CheckMate().verify_claim(c)
+        assert report.passed
+        ms_findings = [f for f in report.findings if "measurement_state" in f.rule]
+        assert not ms_findings, \
+            f"Non-conversion with resolved state should be silent; got {ms_findings}"
+
+    def test_conversion_method_name_with_flag_false_does_not_trigger_gate(self):
+        """Conversion-looking method + conversion_applied=False → substring inference gone."""
+        # Method name looks like conversion, but flag says False
+        c = claim(
+            measurement_state="UNRESOLVED",
+            method="bbx.tool.bulked_to_insitu_custom",
+            description="Method name contains conversion keywords, flag False",
+            conversion_applied=False,
+            quantity=Quantity(value=42.5, unit=Unit.M3),
+        )
+        report = CheckMate().verify_claim(c)
+        assert report.passed, "conversion_applied=False must pass regardless of method name"
+        # Should have WARN for UNRESOLVED, but not FAIL
+        assert not any(f.severity is Severity.FAIL for f in report.findings), \
+            "Flag False with conversion-looking method must not FAIL"
+        assert report.badge() == "VERIFIED (with notes)"
+
+    def test_conversion_applied_persists_correctly(self, tmp_path):
+        """conversion_applied field persists through save/reload, migration, and upsert."""
+        from qsagent.storage.db import QSStore
+        from qsagent.contracts.evidence import EvidenceRef
+        import sqlite3
+
+        # Scenario 1: Migration adds column to legacy DB
+        # Create a legacy table without conversion_applied column
+        legacy_db_path = tmp_path / "legacy.db"
+        legacy_conn = sqlite3.connect(str(legacy_db_path))
+        legacy_conn.execute("CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT)")
+        legacy_conn.execute("INSERT INTO projects (id, name) VALUES (1, 'Legacy Project')")
+        legacy_conn.execute("""
+            CREATE TABLE quantity_claims (
+                claim_id TEXT PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                value REAL NOT NULL,
+                unit TEXT NOT NULL,
+                measurement_state TEXT,
+                method TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                assumptions TEXT NOT NULL DEFAULT '[]',
+                workings TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                CHECK (json_array_length(evidence) >= 1)
+            )
+        """)
+        legacy_conn.commit()
+        legacy_conn.close()
+
+        # Initialize QSStore (should trigger migration)
+        store = QSStore(legacy_db_path)
+        
+        # Verify column was added with default 0
+        cols = {row[1]: row for row in store.conn.execute("PRAGMA table_info(quantity_claims)")}
+        assert "conversion_applied" in cols, "Migration should add conversion_applied column"
+        col_info = cols["conversion_applied"]
+        assert col_info[2] == "INTEGER", "conversion_applied should be INTEGER type"
+        assert col_info[3] == 1, "conversion_applied should be NOT NULL"
+        assert col_info[4] == "0", "conversion_applied should default to 0"
+
+        # Scenario 2: Round-trip preserves True value and gate still rejects
+        project_id = 1  # Use existing legacy project
+        ref = EvidenceRef(
+            file_hash="c" * 64,
+            file_name="test.xls",
+            sheet="Sheet1",
+            raw_text="test conversion",
+        )
+        
+        original = QuantityClaim(
+            project_id=project_id,
+            description="Conversion claim with UNRESOLVED state",
+            quantity=Quantity(value=100.0, unit=Unit.M3),
+            measurement_state="UNRESOLVED",
+            method="test.conversion",
+            conversion_applied=True,
+            evidence=[ref],
+        )
+        store.save_claim(original, ingest_key="test|roundtrip")
+
+        # Reload from database
+        row = store.conn.execute(
+            "SELECT claim_id, description, value, unit, measurement_state, method, conversion_applied "
+            "FROM quantity_claims WHERE ingest_key=?",
+            ("test|roundtrip",)
+        ).fetchone()
+
+        assert row is not None, "Claim not found in database"
+        assert row[6] == 1, "conversion_applied should be stored as 1"
+
+        reloaded = QuantityClaim(
+            claim_id=row[0],
+            project_id=project_id,
+            description=row[1],
+            quantity=Quantity(value=row[2], unit=Unit(row[3])),
+            measurement_state=row[4],
+            method=row[5],
+            conversion_applied=bool(row[6]),
+            evidence=[ref],
+        )
+
+        # CheckMate must still reject
+        report = CheckMate().verify_claim(reloaded)
+        assert not report.passed, \
+            "Reloaded conversion claim with UNRESOLVED must still be REJECTED"
+        assert report.badge() == "REJECTED"
+        fail_findings = [f for f in report.findings
+                         if f.rule == "quantity.measurement_state_conversion"
+                         and f.severity is Severity.FAIL]
+        assert fail_findings, "Expected FAIL after round-trip"
+
+        # Scenario 3: Upsert updates conversion_applied
+        # Save False, then upsert True on same key
+        false_claim = QuantityClaim(
+            project_id=project_id,
+            description="Upsert test claim",
+            quantity=Quantity(value=50.0, unit=Unit.M3),
+            measurement_state="bulked",
+            method="test.upsert",
+            conversion_applied=False,
+            evidence=[ref],
+        )
+        store.save_claim(false_claim, ingest_key="test|upsert")
+        
+        val = store.conn.execute(
+            "SELECT conversion_applied FROM quantity_claims WHERE ingest_key=?",
+            ("test|upsert",)
+        ).fetchone()[0]
+        assert val == 0, "Initial save should have conversion_applied=0"
+
+        # Upsert with True
+        true_claim = QuantityClaim(
+            project_id=project_id,
+            description="Upsert test claim - updated",
+            quantity=Quantity(value=55.0, unit=Unit.M3),
+            measurement_state="bulked",
+            method="test.upsert",
+            conversion_applied=True,
+            evidence=[ref],
+        )
+        store.save_claim(true_claim, ingest_key="test|upsert")
+        
+        val = store.conn.execute(
+            "SELECT conversion_applied FROM quantity_claims WHERE ingest_key=?",
+            ("test|upsert",)
+        ).fetchone()[0]
+        assert val == 1, "Upsert should update conversion_applied to 1"
+        
+        store.close()
 
 
 class TestIngestE2E:
@@ -310,7 +495,7 @@ class TestIngestE2E:
         rows = store.conn.execute(
             """
             SELECT claim_id, description, value, unit,
-                   measurement_state, method
+                   measurement_state, method, conversion_applied
             FROM quantity_claims WHERE project_id = ?
             """,
             (project_id,),
@@ -337,6 +522,7 @@ class TestIngestE2E:
                 quantity=Quantity(value=row[2], unit=Unit(row[3])),
                 measurement_state=row[4],
                 method=row[5],
+                conversion_applied=bool(row[6]),
                 evidence=[ref],
             )
             report = CheckMate().verify_claim(c)

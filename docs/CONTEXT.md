@@ -18,7 +18,7 @@ CheckMate is a pre-response gate emitting VERIFIED / REVIEW / REJECTED.
 5. Revision intelligence, rate normalisation, Excel BOQ engine
 6. EstimateOne Playwright crawler, tender risk register
 ## State
-`main` @ `8b08214`. Repo private, 0 forks.
+`main` @ `b891b9b`. Repo private, 0 forks.
 Tests: **96 collected, 95 passed, 0 failed, 1 skipped** — same from repo root
 and `backend/`. The skip is `test_phase2_real.py` (real data is workstation-only,
 reads `FLUPPER_REAL_PROJECT`). It PASSES on the workstation against live data.

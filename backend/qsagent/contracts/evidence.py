@@ -191,6 +191,13 @@ class QuantityClaim(BaseModel):
             "state cannot be confirmed from project settings."
         ),
     )
+    conversion_applied: bool = Field(
+        False,
+        description=(
+            "True if this claim represents a volume-state conversion "
+            "(e.g., bulked→insitu). False for raw storage or non-conversion operations."
+        ),
+    )
     method: str = Field(..., description="Tool id or calculation method used.")
     evidence: list[EvidenceRef] = Field(..., min_length=1)
     assumption_ids: list[str] = Field(default_factory=list)

@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS quantity_claims (
     value        REAL NOT NULL,
     unit         TEXT NOT NULL,
     measurement_state TEXT,  -- 'bulked','banked','compressed','m3_insitu','UNRESOLVED'; NULL=untracked
+    conversion_applied INTEGER NOT NULL DEFAULT 0,
     method       TEXT NOT NULL,
     evidence     TEXT NOT NULL,
     assumptions  TEXT NOT NULL DEFAULT '[]',
