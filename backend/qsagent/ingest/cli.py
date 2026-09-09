@@ -47,14 +47,38 @@ def _ingest_masterfile(store, project_id, masterfile):
 
 
     bbx_paths = list(masterfile.rglob("*.bbx")) if masterfile.is_dir() else []
+    bbx_records = []
     if bbx_paths:
         bbx_records, bbx_dupes = record_bbx_set(bbx_paths)
         for rec in bbx_records:
-            store.add_document(project_id, file_name=rec.file_name,
-                               file_hash=rec.file_hash, media_type="application/bbx",
-                               title=rec.mudshark_project_name)
+            doc_id = store.add_document(project_id, file_name=rec.file_name,
+                                        file_hash=rec.file_hash, media_type="application/bbx",
+                                        title=rec.mudshark_project_name)
+            node_key = _ikey(str(project_id), "bbx", rec.file_name)
+            store.add_node(EvidenceNode(
+                project_id=project_id, node_type="document",
+                label=rec.file_name, discipline=Discipline.UNKNOWN,
+                payload={"kind": "bbx", "file_hash": rec.file_hash, "doc_id": doc_id,
+                         "project_bf": rec.project_bf, "project_sf": rec.project_sf}
+            ), ingest_key=node_key)
         for a, b in bbx_dupes:
             log.warning("Duplicate BBX: %s == %s", a.file_name, b.file_name)
+
+    project_bf, project_sf = None, None
+    if bbx_records:
+        if any(r.project_bf is None for r in bbx_records):
+            project_bf = None
+        else:
+            bfs = {r.project_bf for r in bbx_records}
+            if len(bfs) == 1:
+                project_bf = bfs.pop()
+                
+        if any(r.project_sf is None for r in bbx_records):
+            project_sf = None
+        else:
+            sfs = {r.project_sf for r in bbx_records}
+            if len(sfs) == 1:
+                project_sf = sfs.pop()
 
     with MudsharkSource(masterfile) as src:
         workbooks = src.parse_all()
@@ -131,41 +155,71 @@ def _ingest_masterfile(store, project_id, masterfile):
 
         if CUT_COL and CUT_COL in qr.values:
             cut_val = qr.values[CUT_COL]
-            # ── Measurement-state resolution ──────────────────────────────────
-            # Mudshark column headers are role labels ('Cut (Bulked m³)' etc.)
-            # but the emitted figures may all be in one unified state (e.g.
-            # in-situ) if the project's BF/SF are both 1.0.  Until the project
-            # settings file is parsed and the factors confirmed to be != 1.0,
-            # applying a bulking-factor conversion would produce a wrong result.
-            # The claim is therefore tagged UNRESOLVED and the raw column value
-            # is stored without conversion.  A later resolution step will apply
-            # the correct factor once BF is confirmed from the BBX project file.
-            bf_val, bf_key = (1.25, "general")
-            for m in qr.materials:
-                bf_val, bf_key = infer_bulking_factor(m.name)
-                break
-            aid = store.next_assumption_id(project_id)
-            store.upsert_assumption(Assumption(
-                id=aid, project_id=project_id,
-                statement=(f"Measurement state of Cut column for '{op}' is UNRESOLVED. "
-                           f"Nominal BF={bf_val} ({bf_key}) from material; not applied until "
-                           f"project BF/SF settings confirmed from BBX. "
-                           f"Raw value={cut_val:.3f} m3 (column: {CUT_COL}).")))
             c_key = _ikey(str(project_id), "mudshark.results", qr.sheet, qr.operation_group,
                           str(qr.occurrence), CUT_COL)
             _guard(c_key, round(cut_val, 3))
-            store.save_claim(QuantityClaim(
-                project_id=project_id,
-                description=f"Cut volume \u2013 {wbs}: {op} [state UNRESOLVED]",
-                quantity=Quantity(value=round(cut_val, 3), unit=Unit.M3),
-                measurement_state="UNRESOLVED",
-                conversion_applied=False,
-                method="mudshark.ingest.cut_raw_unresolved",
-                evidence=[_ref(qr.sheet, qr.row_index, f"{CUT_COL}={cut_val}")],
-                assumption_ids=[aid],
-                workings=[f"Raw={cut_val:.3f} m3; BF={bf_val} ({bf_key}) NOT APPLIED"
-                          f" — state UNRESOLVED pending BBX project settings."],
-            ), ingest_key=c_key)
+
+            if project_bf is None:
+                # ── Missing or conflicting factors ────────────────────────────
+                bf_val, bf_key = (1.25, "general")
+                for m in qr.materials:
+                    bf_val, bf_key = infer_bulking_factor(m.name)
+                    break
+                aid = store.next_assumption_id(project_id)
+                store.upsert_assumption(Assumption(
+                    id=aid, project_id=project_id,
+                    statement=(f"Measurement state of Cut column for '{op}' is UNRESOLVED. "
+                               f"Nominal BF={bf_val} ({bf_key}) from material; not applied until "
+                               f"project BF/SF settings confirmed from BBX. "
+                               f"Raw value={cut_val:.3f} m3 (column: {CUT_COL}).")
+                ))
+                store.save_claim(QuantityClaim(
+                    project_id=project_id,
+                    description=f"Cut volume \u2013 {wbs}: {op} [state UNRESOLVED]",
+                    quantity=Quantity(value=round(cut_val, 3), unit=Unit.M3),
+                    measurement_state="UNRESOLVED",
+                    conversion_applied=False,
+                    method="mudshark.ingest.cut_raw_unresolved",
+                    evidence=[_ref(qr.sheet, qr.row_index, f"{CUT_COL}={cut_val}")],
+                    assumption_ids=[aid],
+                    workings=[f"Raw={cut_val:.3f} m3; BF={bf_val} ({bf_key}) NOT APPLIED"
+                              f" — state UNRESOLVED pending BBX project settings."],
+                ), ingest_key=c_key)
+            elif project_bf == 1.0:
+                # ── Unity factor: already equal to insitu ──────────────────────
+                store.save_claim(QuantityClaim(
+                    project_id=project_id,
+                    description=f"Cut volume \u2013 {wbs}: {op}",
+                    quantity=Quantity(value=round(cut_val, 3), unit=Unit.M3),
+                    measurement_state="bulked",
+                    conversion_applied=False,
+                    method="mudshark.ingest.cut_raw",
+                    evidence=[_ref(qr.sheet, qr.row_index, f"{CUT_COL}={cut_val}")],
+                    assumption_ids=[],
+                    workings=[f"Raw={cut_val:.3f} m3 (BF=1.0 confirmed from BBX)."],
+                ), ingest_key=c_key)
+            else:
+                # ── Non-unity factor: convert to insitu ────────────────────────
+                insitu_val = bulked_to_insitu(cut_val, project_bf)
+                aid = store.next_assumption_id(project_id)
+                store.upsert_assumption(Assumption(
+                    id=aid, project_id=project_id,
+                    statement=(f"Bulking factor {project_bf} applied to convert {cut_val:.3f} bulked m3 "
+                               f"to {insitu_val:.3f} insitu m3."),
+                    status="ASSUMED"
+                ))
+                store.save_claim(QuantityClaim(
+                    project_id=project_id,
+                    description=f"Cut volume \u2013 {wbs}: {op} [converted to insitu]",
+                    quantity=Quantity(value=round(insitu_val, 3), unit=Unit.M3),
+                    measurement_state="m3_insitu",
+                    conversion_applied=True,
+                    method="mudshark.ingest.cut_bulked_to_insitu",
+                    evidence=[_ref(qr.sheet, qr.row_index, f"{CUT_COL}={cut_val}")],
+                    assumption_ids=[aid],
+                    workings=[f"Raw={cut_val:.3f} bulked m3",
+                              f"Conversion: {cut_val:.3f} / {project_bf} (BF) = {insitu_val:.3f} insitu m3."],
+                ), ingest_key=c_key)
 
     for lr in results_wb.linear_rows:
         if lr.sheet != "Trenches":

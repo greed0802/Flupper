@@ -35,6 +35,8 @@ class BbxRecord:
     mudshark_project_name: Optional[str] = None   # from <Project><Name> in XML
     inner_file_count: int = 0
     inner_extensions: dict[str, int] = field(default_factory=dict)
+    project_bf: Optional[float] = None
+    project_sf: Optional[float] = None
     error: Optional[str] = None
 
 
@@ -53,6 +55,67 @@ def _extract_project_name(zip_bytes: bytes) -> Optional[str]:
     except Exception as exc:
         log.debug("bbx xml extract failed: %s", exc)
     return None
+
+
+def _resolve_factor(values: set[str]) -> Optional[float]:
+    import math
+    if not values:
+        return None
+    
+    parsed = []
+    for v in values:
+        if not v:
+            return None  # missing or empty
+        try:
+            val = float(v.strip())
+            if not math.isfinite(val) or val <= 0:
+                return None  # non-finite or non-positive
+            parsed.append(val)
+        except ValueError:
+            return None  # malformed
+    
+    if not parsed:
+        return None
+        
+    first = parsed[0]
+    for val in parsed[1:]:
+        if not math.isclose(val, first, rel_tol=1e-5):
+            return None  # conflicting
+            
+    return first
+
+
+def _extract_factors(zip_bytes: bytes) -> tuple[Optional[float], Optional[float]]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            xml_names = [m for m in zf.namelist() if m.endswith(".xml")]
+            if not xml_names:
+                return None, None
+            xml_data = zf.read(xml_names[0])
+            root = ET.fromstring(xml_data)
+            bfs: set[str] = set()
+            sfs: set[str] = set()
+            materials = root.findall(".//Materials/Material")
+            if not materials:
+                return None, None
+                
+            for mat in materials:
+                bf_el = mat.find("BulkingFactor")
+                if bf_el is not None and bf_el.text:
+                    bfs.add(bf_el.text.strip())
+                else:
+                    bfs.add("")
+                    
+                cf_el = mat.find("CompressionFactor")
+                if cf_el is not None and cf_el.text:
+                    sfs.add(cf_el.text.strip())
+                else:
+                    sfs.add("")
+                    
+            return _resolve_factor(bfs), _resolve_factor(sfs)
+    except Exception as exc:
+        log.debug("bbx factors extract failed: %s", exc)
+        return None, None
 
 
 def _inner_stats(zip_bytes: bytes) -> tuple[int, dict[str, int]]:
@@ -86,6 +149,7 @@ def record_bbx(path: Path) -> BbxRecord:
 
     rec.mudshark_project_name = _extract_project_name(data)
     rec.inner_file_count, rec.inner_extensions = _inner_stats(data)
+    rec.project_bf, rec.project_sf = _extract_factors(data)
     return rec
 
 
