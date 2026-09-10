@@ -56,6 +56,36 @@ def _fast_profile(**overrides) -> ResourceProfile:
     return ResourceProfile(**base)
 
 
+def _tier3(
+    session: AgentSession,
+    tool_id: str,
+    argv,
+    *,
+    workspace_parent,
+    profile: ResourceProfile = SAFE_PROFILE,
+    network_policy: NetworkPolicy = NetworkPolicy.BEST_EFFORT,
+    environment: dict[str, str] | None = None,
+    stdin: bytes | None = None,
+):
+    """Run one Tier 3 tool through the real request-based session contract.
+
+    Mirrors how the API gateway builds a request: the tool id and the approval
+    key are derived from the same string, so approving ``tool_<tool_id>`` and
+    executing this request are guaranteed to refer to the same action id.
+    """
+    return session.execute_tier3(
+        SandboxRequest(
+            argv=tuple(argv),
+            profile=profile,
+            workspace_parent=Path(workspace_parent),
+            approval_id=f"tool_{tool_id}",
+            stdin=stdin,
+            environment=environment,
+            network_policy=network_policy,
+        )
+    )
+
+
 def _pid_running(pid: int) -> bool:
     """True only when the process exists *and* is still running."""
     if sys.platform == "win32":  # pragma: no cover - platform specific
@@ -100,7 +130,8 @@ def _pid_running(pid: int) -> bool:
 def test_successful_execution(tmp_path):
     session = _approved_session("echo")
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "echo",
         (sys.executable, "-c", "print('hello-tier3')"),
         workspace_parent=tmp_path,
@@ -125,7 +156,8 @@ def test_no_shell_injection(tmp_path):
     session = _approved_session("inject")
     hostile = "& del /f /q C:\\*" if os.name == "nt" else "; rm -rf / --no-preserve-root"
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "inject",
         (sys.executable, "-c", "import sys; print(sys.argv[1])", hostile),
         workspace_parent=tmp_path,
@@ -142,7 +174,8 @@ def test_no_shell_injection(tmp_path):
 def test_nonzero_exit(tmp_path):
     session = _approved_session("boom")
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "boom",
         (sys.executable, "-c", "raise SystemExit(42)"),
         workspace_parent=tmp_path,
@@ -169,7 +202,8 @@ def test_timeout_terminates_process_tree(tmp_path):
         "time.sleep(999)\n"
     )
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "timeout",
         (sys.executable, "-c", script),
         profile=_fast_profile(timeout_seconds=2.0),
@@ -206,7 +240,8 @@ def test_output_limit(tmp_path):
     profile = _fast_profile(max_output_bytes=8192, timeout_seconds=30.0)
 
     start = time.monotonic()
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "flood",
         (sys.executable, "-c", script),
         profile=profile,
@@ -234,7 +269,8 @@ def test_environment_strips_secrets(tmp_path):
         "print('SAFE_VAR=' + os.environ.get('SAFE_VAR', 'MISSING'))\n"
     )
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "env",
         (sys.executable, "-c", script),
         environment={"API_KEY": "hunter2", "SAFE_VAR": "visible"},
@@ -254,7 +290,8 @@ def test_environment_strips_secrets(tmp_path):
 def test_workspace_cleanup_success(tmp_path):
     session = _approved_session("clean")
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "clean",
         (sys.executable, "-c", "print('ok')"),
         workspace_parent=tmp_path,
@@ -267,7 +304,8 @@ def test_workspace_cleanup_success(tmp_path):
 def test_workspace_cleanup_on_timeout(tmp_path):
     session = _approved_session("clean_timeout")
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "clean_timeout",
         (sys.executable, "-c", "import time; time.sleep(999)"),
         profile=_fast_profile(timeout_seconds=1.0),
@@ -303,7 +341,7 @@ def test_invalid_request(tmp_path):
     session = _approved_session("missing")
     missing = str(tmp_path / "definitely-not-a-real-binary")
 
-    result = session.execute_tier3("missing", (missing,), workspace_parent=tmp_path)
+    result = _tier3(session, "missing", (missing,), workspace_parent=tmp_path)
 
     assert result.ok is False
     assert result.error_code == "SPAWN_FAILED"
@@ -325,7 +363,8 @@ def test_strict_network_fails_closed(tmp_path):
 
     if backend.supports_network_isolation():
         # A backend that genuinely isolates the network may run the request.
-        result = session.execute_tier3(
+        result = _tier3(
+            session,
             "netstrict",
             argv,
             network_policy=NetworkPolicy.BLOCK_STRICT,
@@ -335,7 +374,8 @@ def test_strict_network_fails_closed(tmp_path):
     else:
         # Fail closed: reject before spawning anything.
         with pytest.raises(SandboxPolicyViolationError, match="BLOCK_STRICT"):
-            session.execute_tier3(
+            _tier3(
+                session,
                 "netstrict",
                 argv,
                 network_policy=NetworkPolicy.BLOCK_STRICT,
@@ -354,7 +394,8 @@ def test_tier3_approval_required(tmp_path):
     session.start_executing()
 
     with pytest.raises(ApprovalRequiredError):
-        session.execute_tier3(
+        _tier3(
+            session,
             "noapproval",
             (sys.executable, "-c", "print('nope')"),
             workspace_parent=tmp_path,
@@ -372,7 +413,8 @@ def test_tier3_approval_required(tmp_path):
 def test_failed_sandbox_blocks_validation(tmp_path):
     session = _approved_session("fail")
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "fail",
         (sys.executable, "-c", "raise SystemExit(3)"),
         workspace_parent=tmp_path,
@@ -397,7 +439,8 @@ def test_journal_no_secrets(tmp_path):
     session.start_executing()
     session.approve("tool_secret", ApprovalLevel.CONFIRM)
 
-    result = session.execute_tier3(
+    result = _tier3(
+        session,
         "secret",
         (sys.executable, "-c", "print('PUBLIC_OUTPUT')"),
         environment={"SECRET_TOKEN": "abc123", "SAFE_VAR": "visible"},

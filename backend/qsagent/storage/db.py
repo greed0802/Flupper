@@ -42,7 +42,18 @@ class QSStore:
 
     def __init__(self, path: str | Path = ":memory:") -> None:
         self.path = str(path)
-        self.conn = sqlite3.connect(self.path)
+        # The gateway serves requests from a worker thread pool, so the
+        # connection is routinely touched from more than one thread. The
+        # alternative - one connection per thread - is impossible here because
+        # an AgentSession holds a single store reference for its whole life.
+        #
+        # check_same_thread=False drops Python's thread-affinity assertion, not
+        # SQLite's own serialisation: this build reports threadsafety == 3, so
+        # individual statements cannot corrupt the file. It does NOT make
+        # *transactions* interleave safely, so callers that share one store
+        # across threads must serialise their read-modify-write sequences
+        # themselves. The gateway does that with one app-wide lock.
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
@@ -118,6 +129,19 @@ class QSStore:
         if row:
             return int(row["id"])
         return self.create_project(name, client, tender_no)
+
+    def get_project(self, project_id: int) -> dict | None:
+        """Return one project row as a plain dict, or None when absent.
+
+        Read-only lookup used by the API gateway to distinguish "unknown
+        project" (404) from "known project, no session yet" (404 on the
+        session routes). It never creates anything.
+        """
+        row = self.conn.execute(
+            "SELECT id, name, client, tender_no, created_at FROM projects WHERE id=?",
+            (project_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def create_project(self, name: str, client: str | None = None,
                        tender_no: str | None = None) -> int:

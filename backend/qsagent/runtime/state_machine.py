@@ -1,10 +1,9 @@
 import logging
-import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 from typing import Optional
 
 from ..checkmate.engine import CheckMate
@@ -12,9 +11,6 @@ from ..contracts.evidence import ApprovalLevel, QuantityClaim, ToolRun
 from ..storage.db import QSStore
 from .sandbox import (
     AuditFailureError,
-    NetworkPolicy,
-    ResourceProfile,
-    SAFE_PROFILE,
     SandboxRequest,
     SandboxResult,
     execute as execute_in_sandbox,
@@ -84,6 +80,12 @@ class AgentSession:
         self._store = store
         self.default_actor = actor
         self._state = SessionState.RECEIVED
+        # A segment is one continuous run bounded by an explicit lifecycle
+        # boundary (start_executing / restart). It never repeats within a
+        # session, so it is safe to bind pending approvals to it: an approval
+        # minted in an earlier REASONING segment can never authorise an action
+        # in a later one that happens to share the same state name.
+        self._segment_id = str(uuid.uuid4())
         self._history: list[TransitionRecord] = []
         self._tool_runs: list[ToolRun] = []
         self._model_runs: list[ModelRun] = []
@@ -92,6 +94,16 @@ class AgentSession:
     @property
     def state(self) -> SessionState:
         return self._state
+
+    @property
+    def segment_id(self) -> str:
+        """Opaque identifier for the current execution segment.
+
+        Rotated by ``start_executing()`` and every ``restart()``. Callers must
+        treat it as a token of the *current* segment only; a value observed
+        earlier in the session is stale by construction.
+        """
+        return self._segment_id
 
     @property
     def history(self) -> list[TransitionRecord]:
@@ -136,7 +148,8 @@ class AgentSession:
             self._approvals.clear()
             self._tool_runs.clear()
             self._model_runs.clear()
-            
+            self._segment_id = str(uuid.uuid4())
+
         record = TransitionRecord(
             from_state=self._state,
             to_state=to,
@@ -164,6 +177,7 @@ class AgentSession:
         self._approvals.clear()
         self._tool_runs.clear()
         self._model_runs.clear()
+        self._segment_id = str(uuid.uuid4())
         return self._transition(
             {SessionState.PLANNED},
             SessionState.EXECUTING,
@@ -194,26 +208,32 @@ class AgentSession:
         """True when any recorded tool run (any tier) failed."""
         return any(not run.ok for run in self._tool_runs)
 
+    @property
+    def tool_runs(self) -> list[ToolRun]:
+        """Copy of the bounded tool-run records for the current segment."""
+        return list(self._tool_runs)
+
     def _audit_tier3(self, action: str, payload: dict) -> None:
         """Bounded Tier 3 audit sink used by the sandbox orchestrator."""
         self._write_journal(self.default_actor, action, subject="tier3", payload=payload)
 
     def execute_tier3(
         self,
-        tool_id: str,
-        argv: list[str] | tuple[str, ...],
+        request: SandboxRequest,
         *,
-        profile: ResourceProfile = SAFE_PROFILE,
-        workspace_parent: Path | str | None = None,
-        stdin: bytes | None = None,
-        environment: dict[str, str] | None = None,
-        network_policy: NetworkPolicy = NetworkPolicy.BEST_EFFORT,
         actor: str | None = None,
     ) -> SandboxResult:
-        """Execute an argv vector inside the Tier 3 sandbox.
+        """Execute one prepared ``SandboxRequest`` inside the Tier 3 sandbox.
+
+        The session does not build the request. ``argv``, ``profile``,
+        ``workspace_parent``, ``stdin``, ``environment`` and ``network_policy``
+        are all carried by the immutable request object, and its
+        ``approval_id`` *is* the approval key, so the approval a caller grants
+        and the execution a caller then performs refer to exactly the same
+        action id by construction rather than by convention.
 
         Approval
-            Requires ``CONFIRM`` for action id ``tool_<tool_id>``; the approval is
+            Requires ``CONFIRM`` for ``request.approval_id``; the approval is
             checked *before* any process starts and consumed exactly once after
             the attempt, even when the attempt fails.
 
@@ -233,19 +253,14 @@ class AgentSession:
                 f"Must be EXECUTING."
             )
 
-        approval_id = f"tool_{tool_id}"
-        if workspace_parent is None:
-            workspace_parent = Path(tempfile.gettempdir())
-
-        request = SandboxRequest(
-            argv=tuple(argv),
-            profile=profile,
-            workspace_parent=Path(workspace_parent),
-            approval_id=approval_id,
-            stdin=stdin,
-            environment=environment,
-            network_policy=network_policy,
-        )
+        approval_id = request.approval_id
+        # The payload already carries the bounded profile name; derive a stable
+        # tool id for the record from the approval key when it follows the
+        # ``tool_<id>`` convention, otherwise fall back to the raw key.
+        if approval_id.startswith("tool_"):
+            tool_id = approval_id[len("tool_"):]
+        else:
+            tool_id = approval_id
 
         result = execute_in_sandbox(
             request,
@@ -262,7 +277,7 @@ class AgentSession:
                 inputs={
                     "argv0": request.argv[0],
                     "argc": len(request.argv),
-                    "profile": profile.name,
+                    "profile": request.profile.name,
                     "network_policy": request.network_policy.value,
                 },
                 outputs={
