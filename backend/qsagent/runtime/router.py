@@ -206,6 +206,22 @@ class ModelRouter:
             provider.name, provider.supported_tier.value,
         )
 
+    def get_tier(self, task_id: str) -> ModelTier:
+        """Return the policy tier for *task_id* from the canonical policy table.
+
+        Raises:
+            UnknownTaskError — task_id not in the policy table
+
+        This is the single source of truth for the question "may this task run
+        locally, or does it require a BYOK credential?". Callers must not
+        re-derive routing from task-name substrings, and must not keep their own
+        copy of the policy.
+        """
+        if task_id not in _POLICY:
+            raise UnknownTaskError(task_id)
+        return _POLICY[task_id]
+
+
     def complete(self, task_id: str, prompt: str) -> ProviderResponse:
         """Route *prompt* to the correct provider for *task_id*.
 

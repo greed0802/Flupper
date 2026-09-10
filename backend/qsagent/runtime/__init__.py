@@ -1,7 +1,9 @@
 from .state_machine import (
     AgentSession,
+    ApprovalConsumptionError,
     ApprovalRequiredError,
     InvalidTransitionError,
+    ModelRun,
     SessionState,
     ToolFailureError,
     TransitionRecord,
@@ -35,8 +37,10 @@ from .sandbox import (
 __all__ = [
     # state machine
     "AgentSession",
+    "ApprovalConsumptionError",
     "ApprovalRequiredError",
     "InvalidTransitionError",
+    "ModelRun",
     "SessionState",
     "ToolFailureError",
     "TransitionRecord",

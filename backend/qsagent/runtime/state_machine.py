@@ -1,5 +1,6 @@
 import logging
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -10,6 +11,7 @@ from ..checkmate.engine import CheckMate
 from ..contracts.evidence import ApprovalLevel, QuantityClaim, ToolRun
 from ..storage.db import QSStore
 from .sandbox import (
+    AuditFailureError,
     NetworkPolicy,
     ResourceProfile,
     SAFE_PROFILE,
@@ -17,6 +19,7 @@ from .sandbox import (
     SandboxResult,
     execute as execute_in_sandbox,
 )
+from .router import ModelRouter, ModelTier, ProviderResponse
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +42,14 @@ class ToolFailureError(RuntimeError):
         super().__init__(f"Tool run {run.tool_id} failed: {run.error}")
         self.run = run
 
+class ApprovalConsumptionError(RuntimeError):
+    """A model call was attempted but its one-shot approval was not consumed.
+
+    Raised after the attempt, never before it: the external call already
+    happened, and a reusable approval token is a security defect even when the
+    provider call itself succeeded.
+    """
+
 @dataclass
 class TransitionRecord:
     from_state: SessionState
@@ -50,6 +61,23 @@ class TransitionRecord:
     timestamp: datetime
     journal_seq: int
 
+@dataclass
+class ModelRun:
+    """Bounded record of one model execution inside a session.
+
+    Invariant: never contains prompt text, model output, a credential, or a raw
+    provider message. error_code is an exception class name only.
+    """
+
+    task_id: str
+    tier: str
+    provider_name: Optional[str]
+    model_name: Optional[str]
+    usage_tokens: Optional[int]
+    duration_ms: int
+    ok: bool
+    error_code: Optional[str]
+
 class AgentSession:
     def __init__(self, project_id: int, *, store: QSStore | None = None, actor: str = "agent") -> None:
         self.project_id = project_id
@@ -58,6 +86,7 @@ class AgentSession:
         self._state = SessionState.RECEIVED
         self._history: list[TransitionRecord] = []
         self._tool_runs: list[ToolRun] = []
+        self._model_runs: list[ModelRun] = []
         self._approvals: dict[str, ApprovalLevel] = {}
 
     @property
@@ -106,6 +135,7 @@ class AgentSession:
         if action == "restart":
             self._approvals.clear()
             self._tool_runs.clear()
+            self._model_runs.clear()
             
         record = TransitionRecord(
             from_state=self._state,
@@ -133,6 +163,7 @@ class AgentSession:
         a = actor or self.default_actor
         self._approvals.clear()
         self._tool_runs.clear()
+        self._model_runs.clear()
         return self._transition(
             {SessionState.PLANNED},
             SessionState.EXECUTING,
@@ -252,6 +283,149 @@ class AgentSession:
         return result
 
 
+    @property
+    def has_failed_models(self) -> bool:
+        """True when any model run recorded in this segment failed."""
+        return any(not run.ok for run in self._model_runs)
+
+    @property
+    def model_runs(self) -> list[ModelRun]:
+        """Copy of the bounded model-run records for the current segment."""
+        return list(self._model_runs)
+
+    def execute_model_task(
+        self,
+        task_id: str,
+        prompt: str,
+        router: ModelRouter,
+        *,
+        actor: str | None = None,
+    ) -> ProviderResponse:
+        """Run one routed model task and record a bounded ModelRun.
+
+        Lifecycle
+            Legal only in REASONING. This call never moves the session between
+            states; it records evidence that ``deliver`` then enforces.
+
+        Approval
+            BYOK_MODEL tasks require CONFIRM for action id ``model_<task_id>``.
+            The approval is checked before the provider is reached, and consumed
+            exactly once after the attempt - including when the attempt failed
+            or when audit recording itself failed, so a token can never be
+            replayed into a second external call.
+
+        Recording
+            The ModelRun and the journal payload carry bounded metadata only:
+            task_id, tier, provider/model name, usage tokens, duration, a boolean
+            and a safe error code (an exception class name). Prompts, model
+            output, credentials and raw provider messages are never stored.
+
+        Raises
+            InvalidTransitionError    - not in REASONING
+            UnknownTaskError          - task_id not in the router policy
+            ApprovalRequiredError     - BYOK task without prior CONFIRM approval
+            AuditFailureError         - the attempt completed but audit failed
+            ApprovalConsumptionError  - the attempt completed but the one-shot
+                                        approval could not be consumed
+            RouterError subclass      - re-raised unchanged from the router
+
+            When several of these apply the precedence is:
+            audit failure > approval-consumption failure > router failure.
+        """
+        if self._state is not SessionState.REASONING:
+            raise InvalidTransitionError(
+                f"Cannot execute model task in state {self._state.value}. "
+                f"Must be REASONING."
+            )
+
+        a = actor or self.default_actor
+        tier = router.get_tier(task_id)  # canonical policy; UnknownTaskError if unknown
+        approval_id = f"model_{task_id}"
+
+        if tier is ModelTier.BYOK_MODEL:
+            self._check_approval(approval_id, ApprovalLevel.CONFIRM)
+
+        start = time.monotonic()
+        response: ProviderResponse | None = None
+        router_err: Exception | None = None
+        audit_err: AuditFailureError | None = None
+        consume_err: ApprovalConsumptionError | None = None
+
+        provider_name: str | None = None
+        model_name: str | None = None
+        usage_tokens: int | None = None
+        error_code: str | None = None
+
+        try:
+            response = router.complete(task_id, prompt)
+            provider_name = response.provider_name
+            model_name = response.model_name
+            usage_tokens = response.usage_tokens
+        except Exception as exc:  # noqa: BLE001 - classified, never re-worded
+            router_err = exc
+            error_code = type(exc).__name__
+        finally:
+            # Duration is measured here; the provider contract has no duration.
+            duration_ms = int((time.monotonic() - start) * 1000)
+            ok = response is not None
+
+            self._model_runs.append(
+                ModelRun(
+                    task_id=task_id,
+                    tier=tier.value,
+                    provider_name=provider_name,
+                    model_name=model_name,
+                    usage_tokens=usage_tokens,
+                    duration_ms=duration_ms,
+                    ok=ok,
+                    error_code=error_code,
+                )
+            )
+
+            payload: dict = {
+                "task_id": task_id,
+                "tier": tier.value,
+                "ok": ok,
+                "duration_ms": duration_ms,
+            }
+            if ok:
+                payload["provider"] = provider_name
+                payload["model"] = model_name
+                payload["usage_tokens"] = usage_tokens
+            else:
+                payload["error_code"] = error_code
+
+            # Audit first, but never at the cost of leaving a live token: the
+            # consumption attempt below runs even when this write raises.
+            try:
+                self._write_journal(
+                    a, "execute_model_task", subject=task_id, payload=payload
+                )
+            except Exception as exc:  # noqa: BLE001
+                audit_err = AuditFailureError(
+                    f"model task {task_id!r} attempted but audit recording "
+                    f"failed: {type(exc).__name__}"
+                )
+
+            if tier is ModelTier.BYOK_MODEL:
+                try:
+                    self._consume_approval(approval_id, ApprovalLevel.CONFIRM)
+                except Exception as exc:  # noqa: BLE001
+                    consume_err = ApprovalConsumptionError(
+                        f"model task {task_id!r} attempted but approval "
+                        f"consumption failed: {type(exc).__name__}"
+                    )
+
+        if audit_err is not None:
+            raise audit_err
+        if consume_err is not None:
+            raise consume_err
+        if router_err is not None:
+            raise router_err
+        assert response is not None  # unreachable: ok implies response was set
+        return response
+
+
     def start_validating(self, *, actor: str | None = None) -> TransitionRecord:
         a = actor or self.default_actor
         if not self._tool_runs:
@@ -285,6 +459,13 @@ class AgentSession:
 
     def deliver(self, response_text: str, claims: list[QuantityClaim], *, actor: str | None = None) -> TransitionRecord:
         a = actor or self.default_actor
+
+        # A failed model execution is an evidence failure: it can never be
+        # reasoned away. CheckMate below remains the final gate for claims.
+        if self.has_failed_models:
+            raise InvalidTransitionError(
+                "Cannot deliver with failed model runs."
+            )
         
         engine = CheckMate()
         for idx, claim in enumerate(claims):
