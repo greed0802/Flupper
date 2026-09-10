@@ -147,8 +147,19 @@ class RLimitBackend:
 
     @staticmethod
     def _capture(proc: subprocess.Popen, max_bytes: int, timeout: float):
-        """Incrementally drain both pipes with a byte budget and a deadline."""
+        """Incrementally drain both pipes with a byte budget and a deadline.
+
+        EOF is tracked per stream: a non-blocking ``read()`` returning ``b""``
+        means that pipe is closed, so the stream is removed from the poll set.
+        Without this, ``select`` keeps reporting a closed pipe as ready and an
+        already-exited child is held until the timeout expires.
+
+        The byte budget is enforced *before* every read and re-checked on the
+        combined result, so ``len(stdout) + len(stderr) <= max_bytes`` holds
+        exactly rather than approximately.
+        """
         streams = [proc.stdout, proc.stderr]
+        active_streams = list(streams)
         buffers: dict[int, bytearray] = {s.fileno(): bytearray() for s in streams}
         for stream in streams:
             os.set_blocking(stream.fileno(), False)
@@ -158,6 +169,9 @@ class RLimitBackend:
         timed_out = False
         output_limited = False
 
+        def remaining() -> int:
+            return max_bytes - total
+
         while True:
             if time.monotonic() - start > timeout:
                 timed_out = True
@@ -165,31 +179,42 @@ class RLimitBackend:
             if total >= max_bytes:
                 output_limited = True
                 break
+            if proc.poll() is not None and not active_streams:
+                # Child exited and both pipes are at EOF: nothing left to read.
+                break
 
-            ready, _, _ = select.select(streams, [], [], 0.1)
+            if not active_streams:
+                # Both pipes closed while the child is still running: keep the
+                # deadline live instead of exiting early.
+                time.sleep(0.02)
+                continue
+
+            ready, _, _ = select.select(active_streams, [], [], 0.05)
             for stream in ready:
+                if remaining() <= 0:
+                    output_limited = True
+                    break
                 try:
-                    chunk = stream.read(_READ_CHUNK)
+                    chunk = stream.read(min(_READ_CHUNK, remaining()))
                 except (BlockingIOError, OSError):
                     continue
                 if chunk:
                     buffers[stream.fileno()].extend(chunk)
                     total += len(chunk)
-                    if total >= max_bytes:
-                        output_limited = True
-                        break
-            if output_limited:
-                break
+                else:
+                    # EOF on this pipe: stop polling it entirely.
+                    active_streams.remove(stream)
 
-            if proc.poll() is not None and not ready:
-                # Process exited and nothing more to read.
+            if total >= max_bytes:
+                output_limited = True
                 break
 
         if not timed_out and not output_limited:
-            for stream in streams:
-                while True:
+            # Child exited normally: drain whatever is still buffered.
+            for stream in active_streams:
+                while remaining() > 0:
                     try:
-                        chunk = stream.read(_READ_CHUNK)
+                        chunk = stream.read(min(_READ_CHUNK, remaining()))
                     except (BlockingIOError, OSError):
                         break
                     if not chunk:
@@ -197,8 +222,13 @@ class RLimitBackend:
                     buffers[stream.fileno()].extend(chunk)
                     total += len(chunk)
 
-        stdout_data = bytes(buffers[proc.stdout.fileno()])[:max_bytes]
-        stderr_data = bytes(buffers[proc.stderr.fileno()])[:max_bytes]
+        # Hard guarantee: combined captured output never exceeds the budget.
+        stdout_data = bytes(buffers[proc.stdout.fileno()])
+        stderr_data = bytes(buffers[proc.stderr.fileno()])
+        if len(stdout_data) + len(stderr_data) > max_bytes:
+            stdout_data = stdout_data[:max_bytes]
+            stderr_data = stderr_data[: max_bytes - len(stdout_data)]
+
         return stdout_data, stderr_data, timed_out, output_limited
 
 
