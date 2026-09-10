@@ -20,20 +20,30 @@ The default posture is: bound to loopback by ``run_local``, single worker
 (the approval registry is in-process), no wildcard CORS, no API docs routes,
 a hard request-body ceiling, and no credential ever carried in a request or
 response body.
+
+Authenticated
+-------------
+Every route under ``API_PREFIX`` requires a bearer token, ``/health`` included,
+and the token is passed into ``create_app`` by the caller rather than read from
+the environment here. There is no unauthenticated mode, no fallback that turns
+one on, and no place a rejected caller can read the expected value back out of a
+response. The comparison is constant-time.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import secrets
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ..contracts.evidence import ApprovalLevel
 from ..runtime import (
@@ -96,6 +106,70 @@ DEFAULT_ALLOWED_ORIGINS: tuple[str, ...] = (
 
 PROFILES = {"safe": SAFE_PROFILE, "development": DEVELOPMENT_PROFILE}
 NETWORK_POLICIES = {policy.value: policy for policy in NetworkPolicy}
+
+
+# --------------------------------------------------------------------------
+# Authentication
+# --------------------------------------------------------------------------
+# Name of the environment variable ``run_local`` reads the bearer token from.
+# The gateway factory itself never touches the environment - the caller passes
+# the token in. That is what lets the test suite drive the real app object with
+# a known token instead of stubbing the check out.
+API_TOKEN_ENV_VAR = "FLUPPER_API_TOKEN"
+
+# One response for every authentication failure. A missing header, a wrong
+# scheme, empty credentials and a mismatched token are deliberately
+# indistinguishable: a caller who can tell them apart has an oracle for
+# probing the token and learns whether a guess was well-formed.
+_AUTH_FAILED_MESSAGE = "authentication required"
+
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _auth_failure() -> HTTPException:
+    """Build the single, non-reflective 401 that every failure path returns.
+
+    The message is a fixed sentence that cannot contain the presented or the
+    expected token, and ``errors`` renders it through the standard envelope, so
+    a rejected caller learns nothing beyond "not authenticated".
+    """
+    return HTTPException(
+        status_code=401,
+        detail=_AUTH_FAILED_MESSAGE,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def require_bearer_token(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> None:
+    """Authenticate one request against the token the app was built with.
+
+    ``auto_error=False`` makes the scheme dependency return ``None`` for a
+    missing, empty or non-bearer header instead of raising, so every failure
+    mode leaves through the one exit below.
+
+    The comparison is :func:`secrets.compare_digest` over UTF-8 *bytes*. Bytes
+    rather than ``str`` because ``compare_digest`` rejects non-ASCII ``str``
+    input with ``TypeError`` - a caller sending a unicode token would otherwise
+    turn an authentication failure into an unhandled 500.
+    """
+    expected = getattr(request.app.state, "api_token", None)
+    if not expected:
+        # Unreachable via ``create_app``, which refuses to build without a
+        # token. Kept as a fail-closed backstop: an app that somehow lost its
+        # token must refuse every request rather than serve them all.
+        log.error("gateway has no configured token; refusing request")
+        raise _auth_failure()
+
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise _auth_failure()
+
+    if not secrets.compare_digest(
+        credentials.credentials.encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise _auth_failure()
 
 
 # --------------------------------------------------------------------------
@@ -334,6 +408,7 @@ def create_app(
     *,
     store: QSStore,
     router: ModelRouter,
+    api_token: str,
     sandbox_root: Path | str = DEFAULT_SANDBOX_ROOT,
     allowed_origins: Sequence[str] = DEFAULT_ALLOWED_ORIGINS,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
@@ -341,11 +416,19 @@ def create_app(
 ) -> FastAPI:
     """Build the gateway around already-constructed collaborators.
 
-    Nothing is read from the environment here. The caller passes the store and
-    the router in, which is what lets a test drive the exact same app object
-    against an in-memory store and an empty router while production swaps in a
-    real database and a real BYOK router - the code path is the same one.
+    Nothing is read from the environment here. The caller passes the store, the
+    router and the bearer token in, which is what lets a test drive the exact
+    same app object against an in-memory store, an empty router and a known
+    token while production swaps in a real database, a real BYOK router and a
+    token from the process environment - the code path is the same one.
+
+    ``api_token`` is required and is validated, not defaulted. A gateway that
+    cannot authenticate is a gateway that must not start: there is deliberately
+    no unauthenticated mode and no fallback that turns one on.
     """
+    if not api_token or not api_token.strip():
+        raise ValueError("api_token is required and must not be blank")
+
     root = ensure_sandbox_root(Path(sandbox_root))
     if not allowed_origins or any(origin == "*" for origin in allowed_origins):
         raise ValueError("allowed_origins must be explicit and must not contain '*'")
@@ -369,6 +452,10 @@ def create_app(
     app.state.sandbox_root = root
     app.state.sessions = sessions
     app.state.approvals = approvals
+    # Held on the app rather than in a module global so two apps built in one
+    # process - which is exactly what the test suite does - cannot authenticate
+    # each other's callers.
+    app.state.api_token = api_token
 
     # Middleware order is resolution order. ``add_middleware`` prepends, so the
     # last call ends up outermost: CORS wraps the body limit, which means an
@@ -380,15 +467,30 @@ def create_app(
         allow_origins=list(allowed_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type"],
+        # ``Authorization`` must be listed or a browser client is blocked at the
+        # preflight and can never authenticate at all. Still no wildcard, and
+        # still no cookies: the token travels in a header, never in an ambient
+        # credential the browser attaches on its own.
+        allow_headers=["Authorization", "Content-Type"],
         max_age=600,
     )
 
     register_error_handlers(app)
 
-    api = APIRouter(prefix=API_PREFIX)
+    # The token requirement is attached to the router, not to each handler, so a
+    # route added later cannot be left unauthenticated by omission. It covers
+    # ``/health`` too - see the note on that route.
+    api = APIRouter(prefix=API_PREFIX, dependencies=[Depends(require_bearer_token)])
 
     # ------------------------------------------------------------------ health
+    # Authenticated, deliberately. ``sandbox_root_ready`` reports whether a real
+    # process-execution workspace exists right now, which is operator state: an
+    # anonymous reader learns whether this workstation is live and able to run
+    # code. Loopback binding hides that today, but this route is also the one a
+    # tunnel or a load balancer is most likely to be pointed at, so the safe
+    # default is chosen now rather than remembered later. Liveness probing that
+    # must bypass authentication belongs on a process supervisor's own check,
+    # not on a route that describes the sandbox.
     @api.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
         """Liveness only. No session, no project, no credentials, no internals."""

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import threading
 import time
@@ -40,7 +41,14 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 
-from qsagent.api import ApprovalError, ApprovalRegistry, create_app
+from qsagent.api import (
+    API_TOKEN_ENV_VAR,
+    DEFAULT_ALLOWED_ORIGINS,
+    DEFAULT_MAX_BODY_BYTES,
+    ApprovalError,
+    ApprovalRegistry,
+    create_app,
+)
 from qsagent.api.approvals import (
     MAX_PENDING_APPROVALS,
     canonical_request_hash,
@@ -57,6 +65,53 @@ from qsagent.runtime import ModelRouter, ModelTier, ProviderResponse
 from qsagent.storage import QSStore
 
 API = "/api/v1"
+
+# The token every fixture builds the app with. Not a secret - it exists so the
+# suite can prove that a *different* value is refused - and it never leaves the
+# test process.
+TEST_TOKEN = "gateway-test-token-0123456789abcdef"
+AUTH_HEADERS = {"Authorization": f"Bearer {TEST_TOKEN}"}
+
+
+def authed_client(app, **kwargs) -> TestClient:
+    """A ``TestClient`` that presents the configured bearer token.
+
+    Authentication is a precondition of every other assertion in this file, so
+    the header lives here rather than being repeated per test. Tests about the
+    authentication boundary itself build ``TestClient(app)`` directly, with no
+    header, so no helper default can silently satisfy the check they are making.
+    """
+    return TestClient(app, headers=dict(AUTH_HEADERS), **kwargs)
+
+
+def iter_routes(app) -> list[tuple[str, str]]:
+    """Every ``(path, method)`` the app actually serves.
+
+    Read from the routing table rather than a hand-written list, so a route
+    added later is covered without anyone remembering to edit a test. FastAPI may
+    keep a router behind a lazy wrapper (``original_router``) instead of
+    flattening it into ``app.routes``, so the walk descends into that wrapper
+    when it is present - which is what makes this work on the flattened form and
+    on the deferred one.
+
+    ``HEAD`` and ``OPTIONS`` are omitted: the first is implied by ``GET`` and the
+    second is answered by the CORS middleware before routing ever happens.
+    """
+    found: set[tuple[str, str]] = set()
+    stack = list(getattr(app, "routes", ()))
+    while stack:
+        route = stack.pop()
+        inner = getattr(route, "original_router", None)
+        if inner is not None:
+            stack.extend(getattr(inner, "routes", ()))
+            continue
+        path = getattr(route, "path", None)
+        if not path:
+            continue
+        for method in getattr(route, "methods", None) or ():
+            if method not in ("HEAD", "OPTIONS"):
+                found.add((path, method))
+    return sorted(found)
 
 # Task ids taken from the router's canonical policy table, not invented here.
 BYOK_TASK = "document_synthesis"
@@ -137,13 +192,14 @@ def app(tmp_path, store, router):
     return create_app(
         store=store,
         router=router,
+        api_token=TEST_TOKEN,
         sandbox_root=tmp_path / "sandboxes",
     )
 
 
 @pytest.fixture()
 def client(app):
-    with TestClient(app) as c:
+    with authed_client(app) as c:
         yield c
 
 
@@ -540,7 +596,13 @@ class TestApprovalRegistry:
 # Contract surface
 # --------------------------------------------------------------------------
 class TestContractSurface:
-    def test_health_is_open_and_reports_sandbox_readiness(self, client):
+    def test_health_requires_the_token_and_reports_sandbox_readiness(self, client):
+        """Health is authenticated *and* minimal: liveness only, no internals.
+
+        The anonymous half of this assertion lives in ``TestAuthenticationFlow``;
+        here the point is that an authenticated health check still exposes
+        nothing beyond two fixed fields.
+        """
         resp = client.get(f"{API}/health")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok", "sandbox_root_ready": True}
@@ -565,6 +627,345 @@ class TestContractSurface:
         # every other failure - callers never have to guess the schema.
         assert set(resp.json()) == {"error", "message"}
         assert resp.json()["error"] == "HTTPException"
+
+
+# --------------------------------------------------------------------------
+# Authentication boundary
+#
+# Every route under ``API_PREFIX`` sits behind a bearer token. These tests exist
+# to prove the *absence* of a way in: an anonymous caller, a malformed header and
+# a wrong token must all fail identically, and the failure must never describe
+# what the right answer was.
+# --------------------------------------------------------------------------
+class TestAuthenticationFlow:
+    def test_anonymous_caller_is_refused_on_a_read_route(self, app):
+        with TestClient(app) as c:
+            resp = c.get(f"{API}/health")
+
+        assert resp.status_code == 401
+        assert set(resp.json()) == {"error", "message"}
+        assert resp.headers.get("www-authenticate") == "Bearer"
+
+    def test_anonymous_caller_is_refused_on_a_write_route(self, app, store):
+        """A refused write must not reach the store at all."""
+        with TestClient(app) as c:
+            resp = c.post(f"{API}/projects", json={"name": "anonymous"})
+
+        assert resp.status_code == 401
+        assert store.get_project(1) is None
+
+    def test_valid_token_succeeds(self, client):
+        resp = client.get(f"{API}/health")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok", "sandbox_root_ready": True}
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "",                       # present but empty
+            "Bearer",                 # scheme with no credentials
+            "Bearer ",                # scheme, separator, nothing after it
+            f"Token {TEST_TOKEN}",    # right value, wrong scheme
+            TEST_TOKEN,               # right value, no scheme at all
+            f"Basic {TEST_TOKEN}",    # wrong scheme that is not even a bearer
+            "Bearer     ",            # whitespace-only credentials
+        ],
+    )
+    def test_malformed_authorization_header_is_refused(self, app, header):
+        with TestClient(app, headers={"Authorization": header}) as c:
+            resp = c.get(f"{API}/health")
+
+        assert resp.status_code == 401, header
+
+    def test_wrong_bearer_token_is_refused(self, app):
+        with TestClient(app, headers={"Authorization": "Bearer wrong-token"}) as c:
+            resp = c.get(f"{API}/health")
+
+        assert resp.status_code == 401
+
+    def test_near_miss_token_is_refused(self, app):
+        """All but the last character of the real token still fails."""
+        almost = TEST_TOKEN[: len(TEST_TOKEN) - 1]
+        with TestClient(app, headers={"Authorization": f"Bearer {almost}"}) as c:
+            resp = c.get(f"{API}/health")
+
+        assert resp.status_code == 401
+
+    def test_non_ascii_token_is_rejected_without_a_type_error(self):
+        """``compare_digest`` refuses non-ASCII ``str``, so the dependency encodes.
+
+        Driven directly rather than through the HTTP client: httpx will not put a
+        non-ASCII byte in a header at all, so the client would fail before the
+        server saw anything. A non-ASCII *configured* token is the realistic
+        case, and one unencoded ``compare_digest`` call would raise ``TypeError``
+        - turning a rejection into a 500, which is both a crash and an oracle.
+        """
+        from types import SimpleNamespace
+
+        from fastapi import HTTPException
+        from fastapi.security import HTTPAuthorizationCredentials
+
+        from qsagent.api.main import require_bearer_token
+
+        def request_holding(token: str):
+            return SimpleNamespace(
+                app=SimpleNamespace(state=SimpleNamespace(api_token=token))
+            )
+
+        expected = "tökén-shared-secret"
+
+        # A wrong ASCII token must come back as 401, not TypeError.
+        with pytest.raises(HTTPException) as excinfo:
+            asyncio.run(
+                require_bearer_token(
+                    request_holding(expected),
+                    HTTPAuthorizationCredentials(scheme="Bearer", credentials="wrong"),
+                )
+            )
+        assert excinfo.value.status_code == 401
+
+        # ...and the non-ASCII token itself must still authenticate.
+        assert (
+            asyncio.run(
+                require_bearer_token(
+                    request_holding(expected),
+                    HTTPAuthorizationCredentials(scheme="Bearer", credentials=expected),
+                )
+            )
+            is None
+        )
+
+    def test_every_failure_is_indistinguishable(self, app):
+        """Missing, malformed and wrong share status, body and headers."""
+        probes = [None, "Bearer", "Basic abc", "Bearer wrong-token", ""]
+        seen = set()
+        for probe in probes:
+            headers = {} if probe is None else {"Authorization": probe}
+            with TestClient(app, headers=headers) as c:
+                resp = c.get(f"{API}/health")
+            seen.add(
+                (
+                    resp.status_code,
+                    json.dumps(resp.json(), sort_keys=True),
+                    resp.headers.get("www-authenticate"),
+                )
+            )
+
+        assert len(seen) == 1, seen
+        assert seen.pop()[0] == 401
+
+    def test_rejection_never_echoes_either_token(self, app):
+        presented = "wrong-token-6f2a-must-not-be-echoed"
+        with TestClient(app, headers={"Authorization": f"Bearer {presented}"}) as c:
+            resp = c.get(f"{API}/health")
+
+        assert resp.status_code == 401
+        assert presented not in resp.text
+        assert TEST_TOKEN not in resp.text
+        # No traceback and no exception repr either: a rejected caller learns
+        # nothing about how the comparison is implemented.
+        assert "Traceback" not in resp.text
+        assert "compare_digest" not in resp.text
+
+    def test_rejection_never_reaches_the_log(self, app, caplog):
+        presented = "wrong-token-6f2a-must-not-be-logged"
+        with caplog.at_level(logging.DEBUG):
+            with TestClient(app, headers={"Authorization": f"Bearer {presented}"}) as c:
+                c.get(f"{API}/health")
+
+        logged = "\n".join(record.getMessage() for record in caplog.records)
+        assert presented not in logged
+        assert TEST_TOKEN not in logged
+
+    def test_every_route_refuses_an_anonymous_caller(self, app):
+        """The router-level dependency covers the whole surface, present and future.
+
+        Driven from the app's own routing table, so a route added later without
+        the token requirement fails here rather than in production. The
+        non-vacuity assertion comes first: a routing change that emptied this
+        list would otherwise turn the sweep into a test that proves nothing.
+        """
+        endpoints = iter_routes(app)
+        assert endpoints, "no routes discovered; the sweep below would be vacuous"
+
+        outside = sorted({path for path, _ in endpoints if not path.startswith(API)})
+        assert outside == [], f"route outside the authenticated prefix: {outside}"
+
+        with TestClient(app) as c:
+            for path, method in endpoints:
+                url = path.replace("{project_id}", "1")
+                resp = c.request(method, url)
+                assert resp.status_code == 401, (method, url, resp.status_code)
+
+    def test_create_app_refuses_a_blank_token(self, tmp_path, store, router):
+        for blank in ("", "   ", "\t\n"):
+            with pytest.raises(ValueError):
+                create_app(
+                    store=store,
+                    router=router,
+                    api_token=blank,
+                    sandbox_root=tmp_path / "sandboxes",
+                )
+
+    def test_oversized_body_is_refused_before_authentication(self, app):
+        """Two controls, one order: the cheap ceiling runs outermost.
+
+        An unauthenticated flood must not make the gateway do body-parsing work
+        before rejecting it.
+        """
+        with TestClient(app) as c:
+            resp = c.post(
+                f"{API}/projects",
+                content=b"x" * (DEFAULT_MAX_BODY_BYTES + 1),
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert resp.status_code == 413
+
+
+# --------------------------------------------------------------------------
+# Token configuration at startup
+#
+# ``run_local`` is the only place a token enters production, so its fail-closed
+# behaviour is asserted directly. The failure mode that matters is the quiet
+# one: starting up without a token and serving everything.
+# --------------------------------------------------------------------------
+class TestStartupTokenConfiguration:
+    def test_missing_token_stops_the_process(self):
+        from qsagent.api.run_local import read_api_token
+
+        with pytest.raises(SystemExit) as excinfo:
+            read_api_token({})
+
+        # The operator is told what to set, and nothing else.
+        assert API_TOKEN_ENV_VAR in str(excinfo.value)
+
+    @pytest.mark.parametrize("value", ["", "   ", "\t"])
+    def test_blank_token_stops_the_process(self, value):
+        from qsagent.api.run_local import read_api_token
+
+        with pytest.raises(SystemExit):
+            read_api_token({API_TOKEN_ENV_VAR: value})
+
+    def test_no_token_is_ever_generated(self):
+        """A configured token is returned verbatim; none is minted in its place."""
+        from qsagent.api.run_local import read_api_token
+
+        supplied = "operator-supplied-token"
+        assert read_api_token({API_TOKEN_ENV_VAR: supplied}) == supplied
+
+    def test_configured_token_is_never_written_to_output(self, capsys):
+        from qsagent.api.run_local import read_api_token
+
+        token = read_api_token({API_TOKEN_ENV_VAR: "  abc123  "})
+
+        assert token == "abc123"
+        captured = capsys.readouterr()
+        assert "abc123" not in captured.out
+        assert "abc123" not in captured.err
+
+    def test_failure_message_never_echoes_the_environment(self):
+        """The message must not interpolate configuration back at the operator.
+
+        ``environ`` is passed with a decoy; if a future edit "helpfully" prints
+        the surrounding configuration, this fails.
+        """
+        from qsagent.api.run_local import read_api_token
+
+        decoy = "decoy-secret-must-not-appear"
+        with pytest.raises(SystemExit) as excinfo:
+            read_api_token({"SOME_OTHER_VAR": decoy})
+
+        message = str(excinfo.value)
+        assert decoy not in message
+        assert "SOME_OTHER_VAR" not in message
+
+    def test_main_refuses_to_start_without_a_token(self, monkeypatch):
+        """The entry point itself, not only the reader: uvicorn must never run."""
+        from qsagent.api import run_local
+
+        monkeypatch.delenv(API_TOKEN_ENV_VAR, raising=False)
+        started: list[int] = []
+        monkeypatch.setattr(run_local.uvicorn, "run", lambda *a, **k: started.append(1))
+
+        with pytest.raises(SystemExit):
+            run_local.main()
+
+        assert started == []
+
+    def test_main_hands_the_configured_token_to_the_app(self, tmp_path, monkeypatch):
+        """The real wiring path: environment -> store -> router -> app -> uvicorn.
+
+        ``main`` is the process entry point and is excluded from coverage, which
+        is exactly where a startup-only mistake hides: a plain typo in there
+        would never surface in the suite because nothing else calls it. So
+        uvicorn is stubbed and the *app* that would have been served is inspected
+        instead.
+        """
+        from qsagent.api import run_local
+
+        monkeypatch.setenv(API_TOKEN_ENV_VAR, "startup-path-token")
+        monkeypatch.setenv(run_local.DB_ENV_VAR, ":memory:")
+        monkeypatch.setenv(run_local.SANDBOX_ROOT_ENV_VAR, str(tmp_path / "sandboxes"))
+        served: dict = {}
+        monkeypatch.setattr(
+            run_local.uvicorn, "run", lambda app, **kwargs: served.update(app=app)
+        )
+
+        run_local.main()
+
+        # Non-vacuous: uvicorn really was reached, and reached with this app.
+        assert set(served) == {"app"}
+        assert served["app"].state.api_token == "startup-path-token"
+
+
+# --------------------------------------------------------------------------
+# CORS posture
+#
+# The browser story has to keep working now that every route needs a header.
+# A preflight cannot carry the credential, so the answer to "may I send
+# Authorization?" is what decides whether a browser client can authenticate.
+# --------------------------------------------------------------------------
+class TestCorsPosture:
+    def test_preflight_allows_authorization_without_a_wildcard(self, app):
+        origin = DEFAULT_ALLOWED_ORIGINS[0]
+        with TestClient(app) as c:
+            resp = c.options(
+                f"{API}/health",
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "GET",
+                    "Access-Control-Request-Headers": "authorization",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert resp.headers["access-control-allow-origin"] == origin
+        assert "authorization" in resp.headers["access-control-allow-headers"].lower()
+        assert resp.headers.get("access-control-allow-credentials") in (None, "false")
+
+    def test_unknown_origin_is_never_granted(self, app):
+        with TestClient(app) as c:
+            resp = c.options(
+                f"{API}/health",
+                headers={
+                    "Origin": "http://not-an-allowed-origin.example",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+
+        assert "access-control-allow-origin" not in resp.headers
+
+    def test_wildcard_origin_is_refused_at_construction(self, tmp_path, store, router):
+        with pytest.raises(ValueError):
+            create_app(
+                store=store,
+                router=router,
+                api_token=TEST_TOKEN,
+                allowed_origins=["*"],
+                sandbox_root=tmp_path / "sandboxes",
+            )
 
 
 # --------------------------------------------------------------------------
@@ -666,10 +1067,11 @@ class TestTier3ApprovalFlow:
         app = create_app(
             store=store,
             router=router,
+            api_token=TEST_TOKEN,
             sandbox_root=tmp_path / "sandboxes",
             approval_ttl_seconds=0.05,
         )
-        with TestClient(app) as c:
+        with authed_client(app) as c:
             project_id = executing_project(c)
             body = echo_body("slow-approver")
             nonce = mint(c, project_id, body).json()["nonce"]
@@ -750,10 +1152,11 @@ class TestTier3RequestValidation:
         app = create_app(
             store=store,
             router=router,
+            api_token=TEST_TOKEN,
             sandbox_root=tmp_path / "sandboxes",
             max_body_bytes=512,
         )
-        with TestClient(app) as c:
+        with authed_client(app) as c:
             project_id = executing_project(c)
             resp = c.post(
                 f"{API}/projects/{project_id}/session/execute_tier3",
@@ -953,8 +1356,13 @@ class TestModelApprovalFlow:
         )
         router = ModelRouter(secrets)
         router.register(long_provider)
-        app = create_app(store=store, router=router, sandbox_root=tmp_path / "sandboxes")
-        with TestClient(app) as c:
+        app = create_app(
+            store=store,
+            router=router,
+            api_token=TEST_TOKEN,
+            sandbox_root=tmp_path / "sandboxes",
+        )
+        with authed_client(app) as c:
             project_id = reasoning_project(c, "long-output")
             prompt = "produce far too much text"
             nonce = model_nonce(c, project_id, BYOK_TASK, prompt)
@@ -998,11 +1406,16 @@ class TestErrorSurface:
         def boom(*args, **kwargs):
             raise RuntimeError(secret)
 
-        app = create_app(store=store, router=router, sandbox_root=tmp_path / "sandboxes")
+        app = create_app(
+            store=store,
+            router=router,
+            api_token=TEST_TOKEN,
+            sandbox_root=tmp_path / "sandboxes",
+        )
         # Starlette re-raises after handing the exception to the registered
         # handler; a real server logs it and closes. That is the behaviour under
         # test, so the client must not re-raise on our behalf.
-        with TestClient(app, raise_server_exceptions=False) as c:
+        with authed_client(app, raise_server_exceptions=False) as c:
             monkeypatch.setattr(store, "get_project", boom)
             resp = c.get(f"{API}/projects/1")
 
@@ -1059,14 +1472,23 @@ def live_server(app):
     thread.join(timeout=20)
 
 
-def call(base: str, method: str, path: str, payload=None):
-    """One JSON round-trip. Returns ``(status, body)``; errors are values."""
+def call(base: str, method: str, path: str, payload=None, token: str | None = TEST_TOKEN):
+    """One JSON round-trip. Returns ``(status, body)``; errors are values.
+
+    Authenticated by default: the concurrency tests are about lock behaviour,
+    not about the authentication boundary, and an anonymous request would now
+    fail before reaching any lock at all. ``token=None`` omits the header so a
+    test can still assert the anonymous path.
+    """
     data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
         base + path,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=120) as response:

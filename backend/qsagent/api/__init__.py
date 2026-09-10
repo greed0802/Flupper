@@ -16,6 +16,7 @@ from .errors import register_error_handlers
 from .limits import DEFAULT_MAX_BODY_BYTES, BodySizeLimitMiddleware
 from .main import (
     API_PREFIX,
+    API_TOKEN_ENV_VAR,
     DEFAULT_ALLOWED_ORIGINS,
     DEFAULT_SANDBOX_ROOT,
     SessionRegistry,
@@ -23,12 +24,14 @@ from .main import (
     create_app,
     ensure_sandbox_root,
     model_action_id,
+    require_bearer_token,
     tier3_action_id,
     tier3_request_hash,
 )
 
 __all__ = [
     "API_PREFIX",
+    "API_TOKEN_ENV_VAR",
     "DEFAULT_ALLOWED_ORIGINS",
     "DEFAULT_MAX_BODY_BYTES",
     "DEFAULT_SANDBOX_ROOT",
@@ -46,6 +49,7 @@ __all__ = [
     "model_action_id",
     "prompt_digest",
     "register_error_handlers",
+    "require_bearer_token",
     "tier3_action_id",
     "tier3_request_hash",
 ]
