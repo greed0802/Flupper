@@ -280,3 +280,18 @@ def test_approve_invalid_state():
     # State is DELIVERED
     with pytest.raises(InvalidTransitionError, match="after delivery"):
         session.approve("anything", ApprovalLevel.REVIEW)
+
+def test_has_failed_tools():
+    session = AgentSession(1)
+    session.plan({})
+    session.start_executing()
+    assert session.has_failed_tools is False
+
+    session.record_tool_run(make_tool(ok=True))
+    assert session.has_failed_tools is False
+
+    # A failing run is recorded before ToolFailureError is raised.
+    with pytest.raises(ToolFailureError):
+        session.record_tool_run(make_tool(ok=False, err="boom"))
+    assert session.has_failed_tools is True
+

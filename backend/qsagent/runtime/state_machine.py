@@ -1,12 +1,22 @@
 import logging
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 from ..checkmate.engine import CheckMate
 from ..contracts.evidence import ApprovalLevel, QuantityClaim, ToolRun
 from ..storage.db import QSStore
+from .sandbox import (
+    NetworkPolicy,
+    ResourceProfile,
+    SAFE_PROFILE,
+    SandboxRequest,
+    SandboxResult,
+    execute as execute_in_sandbox,
+)
 
 log = logging.getLogger(__name__)
 
@@ -147,6 +157,100 @@ class AgentSession:
         
         if not run.ok:
             raise ToolFailureError(run)
+
+    @property
+    def has_failed_tools(self) -> bool:
+        """True when any recorded tool run (any tier) failed."""
+        return any(not run.ok for run in self._tool_runs)
+
+    def _audit_tier3(self, action: str, payload: dict) -> None:
+        """Bounded Tier 3 audit sink used by the sandbox orchestrator."""
+        self._write_journal(self.default_actor, action, subject="tier3", payload=payload)
+
+    def execute_tier3(
+        self,
+        tool_id: str,
+        argv: list[str] | tuple[str, ...],
+        *,
+        profile: ResourceProfile = SAFE_PROFILE,
+        workspace_parent: Path | str | None = None,
+        stdin: bytes | None = None,
+        environment: dict[str, str] | None = None,
+        network_policy: NetworkPolicy = NetworkPolicy.BEST_EFFORT,
+        actor: str | None = None,
+    ) -> SandboxResult:
+        """Execute an argv vector inside the Tier 3 sandbox.
+
+        Approval
+            Requires ``CONFIRM`` for action id ``tool_<tool_id>``; the approval is
+            checked *before* any process starts and consumed exactly once after
+            the attempt, even when the attempt fails.
+
+        Recording
+            A ``ToolRun(tier=3)`` is always appended so downstream validation can
+            see the failure (``has_failed_tools`` / ``start_validating``) instead
+            of the failure being swallowed. Unlike ``record_tool_run`` this does
+            not raise ``ToolFailureError``: the ``SandboxResult`` is returned so
+            the caller can inspect exit code, timeouts and truncation directly.
+
+        Only bounded metadata (argv[0], argument count, profile name, output
+        sizes, exit code) is journalled — never stdin, environment or raw output.
+        """
+        if self._state is not SessionState.EXECUTING:
+            raise InvalidTransitionError(
+                f"Cannot execute tier-3 tool in state {self._state.value}. "
+                f"Must be EXECUTING."
+            )
+
+        approval_id = f"tool_{tool_id}"
+        if workspace_parent is None:
+            workspace_parent = Path(tempfile.gettempdir())
+
+        request = SandboxRequest(
+            argv=tuple(argv),
+            profile=profile,
+            workspace_parent=Path(workspace_parent),
+            approval_id=approval_id,
+            stdin=stdin,
+            environment=environment,
+            network_policy=network_policy,
+        )
+
+        result = execute_in_sandbox(
+            request,
+            check_approval=self._check_approval,
+            consume_approval=self._consume_approval,
+            audit=self._audit_tier3,
+        )
+
+        self._tool_runs.append(
+            ToolRun(
+                project_id=self.project_id,
+                tool_id=tool_id,
+                tier=3,
+                inputs={
+                    "argv0": request.argv[0],
+                    "argc": len(request.argv),
+                    "profile": profile.name,
+                    "network_policy": request.network_policy.value,
+                },
+                outputs={
+                    "exit_code": result.exit_code,
+                    "duration_ms": result.duration_ms,
+                    "stdout_bytes": len(result.stdout),
+                    "stderr_bytes": len(result.stderr),
+                    "timed_out": result.timed_out,
+                    "output_limited": result.output_limited,
+                    "isolation_backend": result.isolation_backend,
+                    "isolation_strength": result.isolation_strength,
+                },
+                ok=result.ok,
+                error=result.error_code,
+                duration_ms=result.duration_ms,
+            )
+        )
+        return result
+
 
     def start_validating(self, *, actor: str | None = None) -> TransitionRecord:
         a = actor or self.default_actor
