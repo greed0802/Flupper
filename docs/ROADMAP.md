@@ -17,7 +17,7 @@ RECEIVED ─► PLANNED ─► EXECUTING ─► VALIDATING ─► REASONING ─�
 └───────────────────────────────┬─────────────────────────────────┘
                                 │ HTTPS / WSS
 ┌───────────────────────────────▼─────────────────────────────────┐
-│   API GATEWAY & TUNNEL (FastAPI) — api.dhanrickeviota.com       │
+│   API GATEWAY & TUNNEL (FastAPI) — api.example.invalid       │
 └───────────────────────────────┬─────────────────────────────────┘
 ┌───────────────────────────────▼─────────────────────────────────┐
 │  AGENT RUNTIME — state machine + model router (local ↔ BYOK)    │
@@ -74,7 +74,7 @@ RECEIVED ─► PLANNED ─► EXECUTING ─► VALIDATING ─► REASONING ─�
 - Human approval gate with diff previews before writing to master BOQ files.
 
 ### Phase 4 — Cloudflare Tunnel & Flutter workstation
-- `cloudflared` routing `api.dhanrickeviota.com → localhost:8000`, bearer auth, CORS.
+- `cloudflared` routing `api.example.invalid → localhost:8000`, bearer auth, CORS.
 - 3-pane Flutter client: Project Explorer/Graph · Agent Canvas · Evidence Inspector.
 
 ### Phase 5 — Revision, cost intelligence, artifact engine
