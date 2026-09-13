@@ -13,8 +13,12 @@ CheckMate is a pre-response gate emitting VERIFIED / REVIEW / REJECTED.
 3. Agent runtime state machine (RECEIVED→PLANNED→EXECUTING→VALIDATING→
    REASONING→DELIVERED), BYOK router, Tier 3 sandbox, SAFE/REVIEW/CONFIRM gates
    — **CURRENT**
-4. Cloudflare Tunnel (api.dhanrickeviota.com → localhost:8000, bearer) +
-   Flutter 3-pane workstation
+4. Cloudflare Tunnel (owner-controlled hostname configured out-of-band via
+   FLUPPER_TUNNEL_HOSTNAME → localhost:8000, bearer) + Flutter 3-pane workstation
+
+The deployment hostname is intentionally represented by `api.example.invalid`
+in tracked documentation. The owner’s real hostname must be supplied through
+local deployment configuration and never committed.
 5. Revision intelligence, rate normalisation, Excel BOQ engine
 6. EstimateOne Playwright crawler, tender risk register
 ## State
