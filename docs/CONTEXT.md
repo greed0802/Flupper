@@ -10,22 +10,21 @@ CheckMate is a pre-response gate emitting VERIFIED / REVIEW / REJECTED.
 ## Phases
 1. SQLite+sqlite-vec store, evidence schemas, Tier 1 QS math — **DONE**
 2. PDF/Mudshark ingestion + knowledge graph — **DONE, merged, frozen**
-3. Agent runtime state machine (RECEIVED→PLANNED→EXECUTING→VALIDATING→
-   REASONING→DELIVERED), BYOK router, Tier 3 sandbox, SAFE/REVIEW/CONFIRM gates
-   — **CURRENT**
-4. Cloudflare Tunnel (owner-controlled hostname configured out-of-band via
-   FLUPPER_TUNNEL_HOSTNAME → localhost:8000, bearer) + Flutter 3-pane workstation
+3. Agent runtime state machine, BYOK router, Tier 3 sandbox, and approval gates
+   — **DONE (3A–3D)**
+4. Local FastAPI gateway and bearer-authenticated boundary — **DONE (4A–4B)**
+5. Controlled Cloudflare Tunnel — **PLANNING (4C)**
+6. Flutter workstation, revision intelligence, rate normalisation, and Excel BOQ
+   engine — **PLANNED**
+7. EstimateOne automation and tender risk register — **PLANNED**
 
-The deployment hostname is intentionally represented by `api.example.invalid`
-in tracked documentation. The owner’s real hostname must be supplied through
-local deployment configuration and never committed.
-5. Revision intelligence, rate normalisation, Excel BOQ engine
-6. EstimateOne Playwright crawler, tender risk register
+The owner-controlled tunnel hostname is configured out-of-band through
+`FLUPPER_TUNNEL_HOSTNAME`; the real value is never committed.
 ## State
-`main` @ `8b08214`. Repo private, 0 forks.
-Tests: **96 collected, 95 passed, 0 failed, 1 skipped** — same from repo root
-and `backend/`. The skip is `test_phase2_real.py` (real data is workstation-only,
-reads `FLUPPER_REAL_PROJECT`). It PASSES on the workstation against live data.
+Latest verified Phase 4B commit: `2a18ca9`.
+Tests: **278 collected, 277 passed, 1 skipped** — same from repo root and
+`backend/`. The skip is `test_phase2_real.py` because real data is workstation-only
+and requires `FLUPPER_REAL_PROJECT`. A skip is not a pass.
 ## Layout
 ```
 backend/qsagent/{contracts,storage,tools,checkmate,ingest}/
