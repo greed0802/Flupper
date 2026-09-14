@@ -9,6 +9,7 @@ every response passes the **QS CheckMate** gate before it reaches a human.
 
 - Architecture and roadmap → [`docs/ROADMAP.md`](docs/ROADMAP.md)
 - Compressed agent context → [`docs/CONTEXT.md`](docs/CONTEXT.md)
+- Local API runbook → [`docs/LOCAL_API_RUNBOOK.md`](docs/LOCAL_API_RUNBOOK.md)
 - Backend → [`backend/`](backend/)
 
 ## Current status
@@ -61,3 +62,6 @@ PYTHONPATH=backend .venv/bin/python -m qsagent.api.run_local
 The server remains bound to exact `127.0.0.1` with one Uvicorn worker. Do not
 place real client data, prompts, credentials, tunnel manifests, or tunnel
 credentials in Git.
+
+Shutdown, recovery, and the full authenticated health check are documented in
+the [local API runbook](docs/LOCAL_API_RUNBOOK.md).
