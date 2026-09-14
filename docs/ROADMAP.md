@@ -17,7 +17,7 @@ RECEIVED ─► PLANNED ─► EXECUTING ─► VALIDATING ─► REASONING ─�
 └───────────────────────────────┬─────────────────────────────────┘
                                 │ HTTPS / WSS — Phase 4C+
 ┌───────────────────────────────▼─────────────────────────────────┐
-│  CONTROLLED TUNNEL (planned) → 127.0.0.1:8000, bearer auth      │
+│  CONTROLLED TUNNEL (opt-in) → 127.0.0.1:8000, bearer auth       │
 └───────────────────────────────┬─────────────────────────────────┘
 ┌───────────────────────────────▼─────────────────────────────────┐
 │  LOCAL FASTAPI GATEWAY — loopback, one worker, authenticated    │
@@ -50,7 +50,7 @@ The real tunnel hostname is owner-controlled and supplied out-of-band through
 | Human Approval | Safe execution boundaries | ✅ Phase 3 |
 | Knowledge Graph | Relational tender model | ✅ Phase 2 |
 | Local API Gateway | Bounded, authenticated lifecycle API | ✅ Phases 4A–4B |
-| Controlled Tunnel | Explicit loopback-only public transport | 🟡 Phase 4C planning |
+| Controlled Tunnel | Explicit loopback-only public transport | ✅ Phase 4C |
 | Flutter Workstation | Project, agent, and evidence client | ⬜ planned |
 
 ## Phases
@@ -77,13 +77,34 @@ The real tunnel hostname is owner-controlled and supplied out-of-band through
 - Constant-time credential comparison and non-reflective 401 responses.
 - No generated, printed, or tracked credentials.
 
-### Phase 4C — Controlled Cloudflare Tunnel 🟡 planning
-- Explicit opt-in connector only; never started by the API process.
-- Strict synthetic/test manifest validation before any real tunnel is considered.
-- Only the loopback API origin may be routed.
-- Exact hostname, credential, catch-all, subprocess, cleanup, and redaction rules
-  remain to be reviewed and implemented.
-- No real tunnel, real client data, or production egress during verification.
+### Phase 4C — Controlled Cloudflare Tunnel ✅ implementation complete — synthetic/local verification only
+- Explicit opt-in connector only; never started by the API process. Nothing in
+  `main`, `run_local`, or `qsagent.api` imports the launcher, so the serving path
+  cannot reach it.
+- Strict manifest validation: exactly one hostname rule followed by exactly one
+  `http_status:404` catch-all. Extra, duplicate, missing, or reordered rules are
+  rejected rather than sanitised.
+- Only the loopback API origin may be routed. The origin is a constant
+  (`http://127.0.0.1:8000`), never read from the manifest, the environment, or an
+  argument, and a test pins it to the address `run_local` binds.
+- The manifest hostname must equal `FLUPPER_TUNNEL_HOSTNAME`.
+- The credential file is path-checked only (absolute, exists, regular file) and
+  is never opened, parsed, or logged.
+- `cloudflared` runs in its own process group with streams inherited, so a signal
+  cannot reach the wrapper and no undrained pipe can deadlock. The temporary
+  config is owner-only and unlinked on every exit path.
+- No quick tunnel, and no automatic production startup integration.
+
+**Scope of this status.** Implementation complete, verified synthetically and
+locally only. No real tunnel connection has been established, no hostname has
+been published, and no production tunnel has been deployed — production tunnel
+deployment remains separately approved.
+
+- The tracked hostname remains synthetic (`api.example.invalid`); the owner's real
+  hostname is supplied out-of-band and is never committed.
+- The API continues to require bearer authentication (`FLUPPER_API_TOKEN`) on
+  every route, including health. The tunnel is transport and authorises nothing.
+- No real client data, credentials, or production egress during verification.
 
 ### Phase 5 — Flutter workstation, revision, cost, and artifacts ⬜ planned
 - 3-pane Project Explorer/Graph, Agent Canvas, and Evidence Inspector.
