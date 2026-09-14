@@ -1,0 +1,63 @@
+name: Workstation
+
+# The Flutter client is a second implementation of the gateway contract, so it
+# is verified on its own terms. Every command below is one that was run locally
+# against the pinned SDK; nothing here is aspirational.
+#
+# The version is pinned exactly, not by range: a Flutter upgrade changes the
+# analyser's lint set and the widget test binding, and "it passed on a newer
+# SDK" is not the same claim as "it passes on the SDK the workstation is built
+# with".
+#
+# 3.47.2 is the pin because it is the SDK the recorded results came from. The
+# approved plan named 3.24.1, which is not installed anywhere this project has
+# been built or tested; see workstation/README.md, "Toolchain". Do not lower this
+# pin without running the suite on the lower version first.
+#
+# The Chrome step needs a runner with a Chrome executable. That has never been
+# executed, locally or here, so treat its result as unverified until it runs.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  workstation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.2
+          channel: stable
+          cache: true
+
+      - name: Report the toolchain
+        run: flutter --version
+
+      - name: Enable web
+        run: flutter config --enable-web
+
+      - name: Resolve dependencies
+        working-directory: workstation
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: workstation
+        run: flutter analyze --fatal-infos
+
+      - name: Test (Dart VM and widget tests)
+        working-directory: workstation
+        run: flutter test
+
+      - name: Test (web platform, Chrome)
+        working-directory: workstation
+        run: flutter test --platform chrome
+
+      - name: Build web
+        working-directory: workstation
+        run: flutter build web
