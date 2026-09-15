@@ -9,6 +9,7 @@ import 'package:flupper_workstation/core/auth_storage.dart';
 import 'package:flupper_workstation/features/health/health_screen.dart';
 
 import '../support/fake_transport.dart';
+import '../support/pump_until.dart';
 
 void main() {
   final config = ApiConfig.parse('http://127.0.0.1:8000');
@@ -43,7 +44,9 @@ void main() {
     await pump(tester, transport);
     expect(find.text('Contacting the gateway...'), findsOneWidget);
 
-    await tester.pump();
+    // Bounded wait for the response to reach the widget. `pumpAndSettle` is
+    // unusable here: the spinner schedules frames forever, so it never settles.
+    await pumpUntilFound(tester, find.text('Status: ok'));
     expect(find.text('Status: ok'), findsOneWidget);
     expect(find.text('Sandbox root is ready.'), findsOneWidget);
     expect(transport.requests.single.url.path, '/api/v1/health');
@@ -56,7 +59,11 @@ void main() {
     );
 
     await pump(tester, transport, onUnauthorized: () => unauthorized++);
-    await tester.pump();
+    await pumpUntil(
+      tester,
+      () => unauthorized == 1,
+      description: 'the onUnauthorized callback',
+    );
 
     expect(unauthorized, 1);
     expect(find.textContaining('rejected this session'), findsNothing);
@@ -69,7 +76,10 @@ void main() {
     );
 
     await pump(tester, transport);
-    await tester.pump();
+    await pumpUntilFound(
+      tester,
+      find.text('The gateway reported an internal error.'),
+    );
 
     expect(find.text('The gateway reported an internal error.'), findsOneWidget);
     expect(find.textContaining('must never be rendered'), findsNothing);
@@ -81,7 +91,10 @@ void main() {
     final transport = FakeTransport((_) async => streamedResponse(200, 'nope'));
 
     await pump(tester, transport);
-    await tester.pump();
+    await pumpUntilFound(
+      tester,
+      find.text('The gateway response could not be read.'),
+    );
 
     expect(find.text('The gateway response could not be read.'), findsOneWidget);
   });
@@ -91,7 +104,7 @@ void main() {
 
     await pump(tester, transport);
     await tester.pump(const Duration(seconds: 11));
-    await tester.pump();
+    await pumpUntilFound(tester, find.text('The gateway did not answer in time.'));
 
     expect(find.text('The gateway did not answer in time.'), findsOneWidget);
   });
@@ -100,7 +113,7 @@ void main() {
     final transport = FakeTransport((request) => connectionRefused(request.url));
 
     await pump(tester, transport);
-    await tester.pump();
+    await pumpUntilFound(tester, find.text('The gateway could not be reached.'));
 
     expect(find.text('The gateway could not be reached.'), findsOneWidget);
   });
@@ -111,12 +124,15 @@ void main() {
     );
 
     await pump(tester, transport);
-    await tester.pump();
+    await pumpUntilFound(tester, find.text('Retry'));
     expect(transport.requests, hasLength(1));
 
     await tester.tap(find.text('Retry'));
-    await tester.pump();
-    await tester.pump();
+    await pumpUntil(
+      tester,
+      () => transport.requests.length == 2,
+      description: 'the retried request',
+    );
 
     expect(transport.requests, hasLength(2));
   });
@@ -128,6 +144,11 @@ void main() {
     final transport = FakeTransport((_) => completer.future);
 
     await pump(tester, transport);
+    await pumpUntil(
+      tester,
+      () => transport.requests.isNotEmpty,
+      description: 'the in-flight request',
+    );
     expect(transport.closed, isFalse);
 
     // Navigate away: the client is closed, which is the only cancellation
@@ -139,7 +160,9 @@ void main() {
     // The response arrives after disposal. Nothing may be rendered from it and
     // nothing may throw.
     completer.complete(okHealth());
-    await tester.pumpAndSettle();
+    await tester.pump();
+    // Let the client deadline fire so no pending timer outlives the test.
+    await tester.pump(const Duration(seconds: 11));
     expect(tester.takeException(), isNull);
     expect(find.text('Status: ok'), findsNothing);
   });

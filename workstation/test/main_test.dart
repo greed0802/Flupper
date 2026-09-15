@@ -8,6 +8,7 @@ import 'package:flupper_workstation/features/projects/project_view.dart';
 import 'package:flupper_workstation/main.dart';
 
 import 'support/fake_transport.dart';
+import 'support/pump_until.dart';
 
 /// The shell decides which of the two screens exists. These tests pin that
 /// decision and the one transition that matters: a rejected token or a sign-out
@@ -36,6 +37,7 @@ void main() {
     ApiConfig? initialConfig,
     required AuthStorage auth,
     required FakeTransport transport,
+    Finder? until,
   }) async {
     await tester.pumpWidget(
       WorkstationApp(
@@ -45,7 +47,11 @@ void main() {
       ),
     );
     await tester.pump();
-    await tester.pump();
+    if (until != null) {
+      // Bounded wait for whatever state this test is about, instead of a fixed
+      // number of frames that the web binding can outrun.
+      await pumpUntilFound(tester, until);
+    }
   }
 
   testWidgets('no configured address means the login form, never a default', (
@@ -55,6 +61,7 @@ void main() {
       tester,
       auth: AuthStorage(),
       transport: FakeTransport(routed),
+      until: find.byType(LoginScreen),
     );
 
     expect(find.byType(LoginScreen), findsOneWidget);
@@ -69,6 +76,7 @@ void main() {
       initialConfig: config,
       auth: AuthStorage()..setToken('test-token'),
       transport: transport,
+      until: find.text('Status: ok'),
     );
 
     expect(find.text('http://127.0.0.1:8000'), findsOneWidget);
@@ -87,10 +95,11 @@ void main() {
       initialConfig: config,
       auth: auth,
       transport: FakeTransport(routed),
+      until: find.text('Sign out'),
     );
 
     await tester.tap(find.text('Sign out'));
-    await tester.pump();
+    await pumpUntilFound(tester, find.byType(LoginScreen));
 
     expect(find.byType(LoginScreen), findsOneWidget);
     expect(auth.hasToken, isFalse);
@@ -105,6 +114,7 @@ void main() {
       initialConfig: config,
       auth: auth,
       transport: FakeTransport((_) async => errorEnvelope(401, 'HTTPException')),
+      until: find.byType(LoginScreen),
     );
 
     expect(find.byType(LoginScreen), findsOneWidget);
@@ -117,10 +127,11 @@ void main() {
       initialConfig: config,
       auth: AuthStorage()..setToken('test-token'),
       transport: FakeTransport(routed),
+      until: find.byIcon(Icons.folder_outlined),
     );
 
     await tester.tap(find.byIcon(Icons.folder_outlined));
-    await tester.pump();
+    await pumpUntilFound(tester, find.text('Load project'));
 
     expect(find.byType(ProjectView), findsOneWidget);
     expect(find.text('Project id'), findsOneWidget);

@@ -206,7 +206,12 @@ def test_timeout_terminates_process_tree(tmp_path):
         session,
         "timeout",
         (sys.executable, "-c", script),
-        profile=_fast_profile(timeout_seconds=2.0),
+        # A test-specific override for max_processes: Linux RLIMIT_NPROC applies
+        # per-user, so the low baseline limit of 8 combined with the baseline
+        # runner processes on GitHub Actions causes the script's `Popen` fork to
+        # fail instantly (EAGAIN). A high ceiling isolates the test to measure
+        # process-tree timeout survival, not starvation.
+        profile=_fast_profile(timeout_seconds=2.0, max_processes=2000),
         workspace_parent=tmp_path,
     )
 

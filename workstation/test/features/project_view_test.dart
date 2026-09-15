@@ -10,6 +10,7 @@ import 'package:flupper_workstation/core/dto_limits.dart';
 import 'package:flupper_workstation/features/projects/project_view.dart';
 
 import '../support/fake_transport.dart';
+import '../support/pump_until.dart';
 
 void main() {
   final config = ApiConfig.parse('http://127.0.0.1:8000');
@@ -33,11 +34,15 @@ void main() {
     );
   }
 
-  Future<void> ask(WidgetTester tester, String text) async {
+  Future<void> ask(WidgetTester tester, String text, {Finder? until}) async {
     await tester.enterText(find.byType(TextField), text);
     await tester.tap(find.text('Load project'));
     await tester.pump();
-    await tester.pump();
+    if (until != null) {
+      // Bounded wait for the response to reach the widget, instead of a fixed
+      // number of frames that the web binding can outrun.
+      await pumpUntilFound(tester, until);
+    }
   }
 
   http.StreamedResponse okProject() => jsonResponse(200, <String, Object>{
@@ -100,7 +105,7 @@ void main() {
       final transport = FakeTransport((_) async => okProject());
 
       await pump(tester, transport);
-      await ask(tester, '7');
+      await ask(tester, '7', until: find.text('Id: 7'));
 
       expect(transport.requests, hasLength(1));
       expect(
@@ -120,12 +125,39 @@ void main() {
       );
 
       await pump(tester, transport);
-      await ask(tester, '$maxProjectId');
+      await ask(tester, '$maxProjectId', until: find.text('Id: $maxProjectId'));
 
       expect(
         transport.requests.single.url.path,
         '/api/v1/projects/$maxProjectId',
       );
+    });
+    testWidgets('a response deferred to a timer task still renders', (tester) async {
+      final transport = FakeTransport((_) async {
+        // Deferred deliberately: the continuation is scheduled on a timer task
+        // rather than a microtask, which is what the response stream does under
+        // the web binding. Two bare `pump()` calls do not cover it, which is
+        // exactly how this test failed under `flutter test --platform chrome`.
+        await Future<void>.delayed(Duration.zero);
+        return okProject();
+      });
+
+      await pump(tester, transport);
+      await ask(tester, '7');
+      // Two more bare pumps: the old idiom in full, plus one for luck. Neither
+      // advances the clock, so neither can fire the deferred continuation.
+      await tester.pump();
+      await tester.pump();
+
+      expect(
+        find.text('Id: 7'),
+        findsNothing,
+        reason: 'the bare-pump idiom is not enough for a deferred response',
+      );
+
+      await pumpUntilFound(tester, find.text('Id: 7'));
+      expect(find.text('Id: 7'), findsOneWidget);
+      expect(find.text('Name: Example project'), findsOneWidget);
     });
   });
 
@@ -136,7 +168,7 @@ void main() {
       );
 
       await pump(tester, transport);
-      await ask(tester, '7');
+      await ask(tester, '7', until: find.text('Not found on the gateway.'));
 
       expect(find.text('Not found on the gateway.'), findsOneWidget);
     });
@@ -149,6 +181,11 @@ void main() {
 
       await pump(tester, transport, onUnauthorized: () => unauthorized++);
       await ask(tester, '7');
+      await pumpUntil(
+        tester,
+        () => unauthorized == 1,
+        description: 'the onUnauthorized callback',
+      );
 
       expect(unauthorized, 1);
     });
@@ -163,7 +200,11 @@ void main() {
       );
 
       await pump(tester, transport);
-      await ask(tester, '7');
+      await ask(
+        tester,
+        '7',
+        until: find.text('The gateway rejected the request shape.'),
+      );
 
       expect(find.text('The gateway rejected the request shape.'), findsOneWidget);
       expect(find.textContaining('must never be rendered'), findsNothing);
@@ -176,13 +217,20 @@ void main() {
 
     await pump(tester, transport);
     await ask(tester, '7');
+    await pumpUntil(
+      tester,
+      () => transport.requests.isNotEmpty,
+      description: 'the in-flight request',
+    );
     expect(transport.closed, isFalse);
 
     await tester.pumpWidget(const MaterialApp(home: SizedBox()));
     expect(transport.closed, isTrue);
 
     completer.complete(okProject());
-    await tester.pumpAndSettle();
+    await tester.pump();
+    // Push the clock past the client deadline so no timer outlives the test.
+    await tester.pump(const Duration(seconds: 11));
     expect(tester.takeException(), isNull);
   });
 }
