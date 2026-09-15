@@ -62,7 +62,8 @@ jobs:
         working-directory: workstation
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          status=0
           while IFS= read -r -d '' file; do
             echo "--- Chrome: ${file} ---"
             # `--reporter expanded` is deliberate. In Actions, Flutter switches
@@ -71,8 +72,16 @@ jobs:
             # exception itself nowhere in the captured log. Two rounds of this
             # step failed with no readable reason. Expanded prints the assertion
             # and the stack.
-            flutter test --platform chrome --reporter expanded "${file}"
-          done < <(find test -type f -name '*_test.dart' -print0)
+            #
+            # The loop does not stop at the first failing file. Aborting meant
+            # one bad file hid the result of every file after it, so a single
+            # run could not say whether the other nine were green.
+            flutter test --platform chrome --reporter expanded "${file}" || {
+              echo "::error::Chrome test file failed: ${file}"
+              status=1
+            }
+          done < <(find test -type f -name '*_test.dart' -print0 | sort -z)
+          exit "${status}"
 
       - name: Build web
         working-directory: workstation
