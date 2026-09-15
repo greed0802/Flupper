@@ -61,10 +61,44 @@ flutter build web
 ```
 
 `flutter test --platform chrome` belongs in that list on a machine that has a
-Chrome executable. It is **not verified**: this workstation has no Chrome, and
-substituting Edge through `CHROME_EXECUTABLE` hung the harness instead of running
-the tests. The CI workflow carries the command; its result is unverified until a
-Chrome-capable runner executes it.
+Chrome executable - but **one file at a time**, not as a bulk suite run:
+
+```bash
+# Web-platform tests, sequentially, one file per Chrome session.
+set -euo pipefail
+while IFS= read -r -d '' file; do
+  echo "--- Chrome: ${file} ---"
+  flutter test --platform chrome "${file}"
+done < <(find test -type f -name '*_test.dart' -print0)
+```
+
+### Why the Chrome tests run per file
+
+Running the whole suite as a single `flutter test --platform chrome` invocation
+loses the browser connection partway through in this project's environment: the
+run stalls after the first file has loaded and never reports a result. Run one
+file per invocation, every file passes.
+
+So CI does exactly that, and the loop is written to stay honest about it:
+
+- **Discovery is null-delimited** (`find -print0` into `read -d ''`), so a test
+  path containing a space can never be split into two bogus arguments. The
+  expansion is quoted for the same reason.
+- **The file name is printed before each run**, so a log that stops mid-suite
+  names the file that stopped it. A bulk run leaves you guessing.
+- **It fails fast.** `set -euo pipefail` means the first non-zero exit ends the
+  loop and fails the job, rather than letting later files mask an earlier
+  failure.
+
+The cost is that each file starts its own Chrome session and its own compile, so
+the step is slower than one bulk invocation would be. That is the trade: a slower
+step that reports, over a faster one that hangs.
+
+This remains **not verified**. No runner with a Chrome executable has executed
+the loop yet - this workstation has no Chrome at all, and substituting Edge
+through `CHROME_EXECUTABLE` hung the harness instead of running the tests. The
+per-file form is untested in the same way the bulk form was, and calling it fixed
+before a Chrome-capable runner reports green would be a claim, not a result.
 
 ## The address is configured, never assumed
 

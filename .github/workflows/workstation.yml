@@ -14,8 +14,12 @@ name: Workstation
 # been built or tested; see workstation/README.md, "Toolchain". Do not lower this
 # pin without running the suite on the lower version first.
 #
-# The Chrome step needs a runner with a Chrome executable. That has never been
-# executed, locally or here, so treat its result as unverified until it runs.
+# The Chrome step runs one test file at a time rather than the whole suite in a
+# single invocation. A bulk `flutter test --platform chrome` run loses the
+# browser connection partway through in this project's environment, while each
+# file passes on its own, so the per-file loop is the form that actually
+# completes. It is still unverified here: no runner with a Chrome executable has
+# executed it yet. Treat its result as unverified until one does.
 
 on:
   push:
@@ -54,9 +58,15 @@ jobs:
         working-directory: workstation
         run: flutter test
 
-      - name: Test (web platform, Chrome)
+      - name: Test (web platform, Chrome, per-file)
         working-directory: workstation
-        run: flutter test --platform chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            echo "--- Chrome: ${file} ---"
+            flutter test --platform chrome "${file}"
+          done < <(find test -type f -name '*_test.dart' -print0)
 
       - name: Build web
         working-directory: workstation
