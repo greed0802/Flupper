@@ -14,7 +14,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 from ..contracts.evidence import (
     ApprovalLevel,
@@ -606,6 +606,58 @@ class QSStore:
         if len(rows) > int(limit):
             return rows[: int(limit)], True
         return rows, False
+
+    def rate_nodes(
+        self, project_id: int, node_ids: Sequence[int]
+    ) -> list[sqlite3.Row]:
+        """``rate`` rows for one project, by id, in id order.
+
+        Three narrowings, each of which is the difference between a lookup and
+        a leak:
+
+        * ``project_id`` is part of the predicate, so an id belonging to another
+          project is a miss - exactly the same miss as an id that never existed.
+          The caller cannot tell the two apart, which is the point: otherwise
+          the route becomes an oracle for which node ids exist elsewhere;
+        * ``node_type='rate'``, so a quantity or drawing id resolves to nothing
+          here rather than being handed back for the caller to re-check;
+        * the ids themselves are the bound - the request model caps them at
+          ``MAX_RATE_NODE_IDS`` - so there is no ``LIMIT`` to get wrong and no
+          truncation flag to interpret. An empty list returns nothing without
+          issuing ``IN ()``, which is not valid SQL.
+
+        No ordering guarantee is needed by the caller (the response carries each
+        node's id), but ``ORDER BY id`` makes the read reproducible anyway.
+        """
+        ids = sorted({int(node_id) for node_id in node_ids})
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        return list(self.conn.execute(
+            "SELECT * FROM evidence_nodes WHERE project_id=?"
+            f"   AND node_type='rate' AND id IN ({placeholders})"
+            " ORDER BY id",
+            (int(project_id), *ids),
+        ))
+
+    def documents_for_project(
+        self, project_id: int, limit: int
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """The three document columns a rate proposal resolves its source from.
+
+        Bounded like every other list read here, and for the same reason: the
+        ceiling is the caller's, so a truncated read is reported rather than
+        silently mistaken for "this project has no such document".
+        """
+        rows = list(self.conn.execute(
+            "SELECT id, file_name, file_hash FROM documents WHERE project_id=?"
+            " ORDER BY id LIMIT ?",
+            (int(project_id), int(limit) + 1),
+        ))
+        if len(rows) > int(limit):
+            return rows[: int(limit)], True
+        return rows, False
+
 
     def claims_for_project(
         self, project_id: int, limit: int

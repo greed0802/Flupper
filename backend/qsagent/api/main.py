@@ -88,6 +88,7 @@ from .contracts import (
 )
 from .errors import register_error_handlers
 from .limits import DEFAULT_MAX_BODY_BYTES, BodySizeLimitMiddleware
+from .rates import register_rate_routes
 from .revisions import register_revision_routes
 
 log = logging.getLogger(__name__)
@@ -767,6 +768,12 @@ def create_app(
     # as everything else and inherits the bearer-token dependency: there is no
     # unauthenticated revision surface to forget to protect.
     register_revision_routes(api, store=store, sessions=sessions)
+
+    # ------------------------------------------------------- rate proposals
+    # Phase 5C. Read-only as well, and registered the same way for the same
+    # reason: on the authenticated router, so there is no rate surface outside
+    # the bearer-token dependency to forget about.
+    register_rate_routes(api, store=store, sessions=sessions)
 
     app.include_router(api)
     return app

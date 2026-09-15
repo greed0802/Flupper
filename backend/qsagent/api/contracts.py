@@ -18,9 +18,17 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    Strict,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
-from ..contracts.evidence import QuantityClaim
+from ..contracts.evidence import QuantityClaim, Unit
 
 # --------------------------------------------------------------------------
 # Hard bounds - single source of truth
@@ -61,6 +69,29 @@ MAX_DIFF_SCANNED_NODES = 2000
 MAX_DIFF_SCANNED_CLAIMS = 2000
 MAX_DIFF_SCANNED_DOCUMENTS = 2000
 
+# ── Phase 5C: evidence-backed rate normalization ─────────────────────────
+# The first phase here whose response carries money. Every bound below is a
+# ceiling on a string the server renders, because a rate is quoted as a decimal
+# string and a bound that only lived inside the normalizer would not be a bound
+# anyone could check.
+#: The ids one request may name. It is also the ceiling on the proposal list,
+#: one item per id, so the response size is decided by the request shape rather
+#: than by how many rows the project happens to hold.
+MAX_RATE_NODE_IDS = 100
+#: Ids are positive and fit in a SQLite INTEGER. The upper bound is not
+#: decoration: an id beyond 64 bits makes the driver raise on binding, which
+#: would surface as a 500 for what is plainly a malformed request.
+MAX_RATE_NODE_ID = 9223372036854775807
+MAX_RATE_TEXT_CHARS = 255
+MAX_RATE_HASH_CHARS = 64
+MAX_RATE_AMOUNT_CHARS = 64
+MAX_RATE_DATE_CHARS = 10
+MAX_RATE_WARNINGS = 8
+#: Documents one request may read to resolve sources. A source that cannot be
+#: resolved because it sits past this bound is reported as truncated rather than
+#: as missing, so a ceiling can never be mistaken for a finding.
+MAX_RATE_SCANNED_DOCUMENTS = 2000
+
 ArgvItem = Annotated[str, StringConstraints(max_length=MAX_ARGV_ITEM_CHARS)]
 
 SandboxProfileName = Literal["safe", "development"]
@@ -71,6 +102,68 @@ DiffStatus = Literal[
 ]
 DiffRelationship = Literal[
     "same_drawing", "unverified_drawing", "evidence_unavailable"
+]
+
+# ── Phase 5C: rate proposal vocabulary ───────────────────────────────────
+# Closed sets, and closed here rather than in the normalizer, so a value the
+# route can emit is a value this file lists. ``test_rate_normalization`` asserts
+# the normalizer's own tuples equal these, which is what stops the two drifting.
+RateStatus = Literal["normalized", "unresolved"]
+RateConfidence = Literal["exact", "inferred", "unresolved"]
+RateCategory = Literal[
+    "plant_time",
+    "labour_time",
+    "material_unit",
+    "volume_cart_away",
+    "subcontract_lumpsum",
+]
+RateCurrency = Literal["AUD"]
+RateUnresolvedReason = Literal[
+    "malformed_payload",
+    "unknown_payload_keys",
+    "missing_source",
+    "invalid_document_id",
+    "invalid_source_hash",
+    "unverified_source",
+    "evidence_unavailable",
+    "source_mismatch",
+    "missing_provenance",
+    "unsupported_provenance",
+    "missing_amount",
+    "invalid_amount",
+    "missing_unit",
+    "unsupported_unit",
+    "missing_category",
+    "unsupported_category",
+    "unit_category_mismatch",
+    "missing_currency",
+    "unsupported_currency",
+    "missing_effective_date",
+    "invalid_effective_date",
+]
+RateWarning = Literal[
+    "locator_unavailable",
+    "sheet_or_page_unavailable",
+    "manual_provenance",
+    "stale_source",
+    "duplicate_source_quote",
+    "source_documents_truncated",
+]
+
+#: The canonical unit a proposal may be quoted in. Reusing the quantity-claim
+#: enum rather than restating it means a unit a rate can be stored in is a unit
+#: a claim can be measured in, and neither list can silently grow alone.
+RateUnit = Unit
+
+#: An id that can name a row: a JSON integer, positive, and inside SQLite's
+#: integer range so a value the driver cannot bind is refused as a malformed
+#: request rather than reaching the store and surfacing as a 500.
+#:
+#: Strict, unlike the rest of this file's integers. An id is not a word and not
+#: a flag: without this, ``"1"`` and ``true`` both select row 1, and a caller
+#: that sent the wrong type would be answered about the wrong row.
+PositiveNodeId = Annotated[
+    int, Field(ge=1, le=MAX_RATE_NODE_ID), Strict()
 ]
 
 #: The two list-item kinds in a diff response. Each is bounded at its own
@@ -326,4 +419,165 @@ class RevisionDiffResponse(BaseModel):
     unverified_claim_references: int
     unassociated_claims: int
     warnings: list[str] = Field(default_factory=list, max_length=MAX_DIFF_WARNINGS)
+
+
+# --------------------------------------------------------------------------
+# Phase 5C - rate proposals (read-only)
+# --------------------------------------------------------------------------
+class RateProposalRequest(_StrictModel):
+    """The ids of the rate rows to propose from, and nothing else.
+
+    There is no field here for a rate, a unit, a currency, a category, a proof
+    reference or a path, so a caller cannot assert any of them. The request
+    names rows the server already holds and the server reads their content
+    itself - which is the whole difference between quoting a stored rate and
+    being handed one.
+    """
+
+    node_ids: list[PositiveNodeId] = Field(
+        ..., min_length=1, max_length=MAX_RATE_NODE_IDS
+    )
+
+    @field_validator("node_ids")
+    @classmethod
+    def _dedupe(cls, value: list[int]) -> list[int]:
+        """Keep the first occurrence of each id, in the order sent.
+
+        Naming the same row twice is asking one question twice. It is resolved
+        rather than rejected: answering it twice would put two identical
+        proposals in the response for a reader to reconcile. The order is the
+        caller's, so the response lines up with the request.
+        """
+        seen: set[int] = set()
+        unique: list[int] = []
+        for node_id in value:
+            if node_id not in seen:
+                seen.add(node_id)
+                unique.append(node_id)
+        return unique
+
+
+class RateProposalDTO(BaseModel):
+    """One rate row: the stored rate, normalized, or a reason there is none.
+
+    Both shapes are final. A normalized proposal is the only one that carries a
+    number, and it always carries the source, unit, currency, category and
+    effective date it was read with - a rate without its dimensions is not a
+    rate. An unresolved proposal carries no number, no unit, no currency and no
+    category at all: a half-populated proposal is exactly the thing a reader
+    would quote as though it were complete.
+
+    No unit conversion is applied, so ``original_unit`` and ``normalized_unit``
+    are the same canonical spelling. The pair is kept because the amount pair is
+    not: an amount may round (``"1.005"`` -> ``"1.01"``) and a reader is entitled
+    to both the reading and the rendering. ``original_amount`` is the row's own
+    text; ``normalized_amount`` is what this platform would quote.
+    """
+
+    node_id: int
+    label: str = Field(..., max_length=MAX_RATE_TEXT_CHARS)
+    status: RateStatus
+    confidence: RateConfidence
+    reason: RateUnresolvedReason | None = None
+    source_document_id: int | None = None
+    source_file_name: str | None = Field(default=None, max_length=MAX_RATE_TEXT_CHARS)
+    source_file_hash: str | None = Field(default=None, max_length=MAX_RATE_HASH_CHARS)
+    original_amount: str | None = Field(
+        default=None, max_length=MAX_RATE_AMOUNT_CHARS
+    )
+    original_unit: str | None = Field(default=None, max_length=MAX_RATE_TEXT_CHARS)
+    normalized_amount: str | None = Field(
+        default=None, max_length=MAX_RATE_AMOUNT_CHARS
+    )
+    normalized_unit: RateUnit | None = None
+    currency: RateCurrency | None = None
+    rate_category: RateCategory | None = None
+    effective_date: str | None = Field(default=None, max_length=MAX_RATE_DATE_CHARS)
+    source_age_days: int | None = None
+    locator_present: bool
+    duplicate_quote_count: int = 0
+    warnings: list[RateWarning] = Field(
+        default_factory=list, max_length=MAX_RATE_WARNINGS
+    )
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "RateProposalDTO":
+        """Refuse to render a proposal that contradicts itself.
+
+        This guards the server's own arithmetic, not the caller's input: no
+        field here is settable by a request. A contradiction is a bug in the
+        normalizer, and it fails at the boundary rather than reaching a reader
+        as an answer that looks complete.
+        """
+        if self.status == "normalized":
+            if self.normalized_amount is None or self.reason is not None:
+                raise ValueError("a normalized proposal needs a number and no reason")
+            required = (
+                self.source_document_id,
+                self.source_file_name,
+                self.source_file_hash,
+                self.original_amount,
+                self.original_unit,
+                self.normalized_unit,
+                self.currency,
+                self.rate_category,
+                self.effective_date,
+                self.source_age_days,
+            )
+            if any(value is None for value in required):
+                raise ValueError(
+                    "a normalized proposal must carry its whole provenance"
+                )
+            if self.confidence == "unresolved":
+                raise ValueError("a normalized proposal cannot be unresolved")
+        else:
+            if self.normalized_amount is not None or self.reason is None:
+                raise ValueError("an unresolved proposal needs a reason and no number")
+            if self.confidence != "unresolved":
+                raise ValueError("an unresolved proposal cannot carry confidence")
+            partial = (
+                self.source_document_id,
+                self.source_file_name,
+                self.source_file_hash,
+                self.original_amount,
+                self.original_unit,
+                self.normalized_unit,
+                self.currency,
+                self.rate_category,
+                self.effective_date,
+                self.source_age_days,
+            )
+            if any(value is not None for value in partial):
+                raise ValueError("an unresolved proposal must not carry a partial result")
+            if self.locator_present:
+                raise ValueError("an unresolved proposal ties nothing to a locator")
+            if self.duplicate_quote_count:
+                raise ValueError("an unresolved proposal cannot duplicate a quote")
+        return self
+
+
+class RateProposalResponse(BaseModel):
+    """Read-only proposals for the rate rows a caller named.
+
+    ``reference_date`` is the day the ages were measured against. Age is the one
+    input that is not in the store, so it travels with the answer: a reader can
+    recompute ``source_age_days`` from ``effective_date`` and this field instead
+    of trusting a figure that depended on when the request happened to run.
+
+    ``normalized`` and ``unresolved`` count the whole answer and always add up to
+    ``len(proposals)``: there is no truncation here, because the request bounds
+    the answer (one proposal per id, at most ``MAX_RATE_NODE_IDS`` ids). The
+    ``warnings`` list is the request's, not a proposal's.
+    """
+
+    project_id: int
+    reference_date: str = Field(..., max_length=MAX_RATE_DATE_CHARS)
+    proposals: list[RateProposalDTO] = Field(
+        default_factory=list, max_length=MAX_RATE_NODE_IDS
+    )
+    normalized: int
+    unresolved: int
+    warnings: list[RateWarning] = Field(
+        default_factory=list, max_length=MAX_RATE_WARNINGS
+    )
 
