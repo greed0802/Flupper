@@ -53,7 +53,10 @@ void main() {
 
     test('accepts a status exactly at the client bound', () {
       final atLimit = valid()..['status'] = 'a' * maxHealthStatusChars;
-      expect(HealthResponse.fromJson(atLimit).status.length, maxHealthStatusChars);
+      expect(
+        HealthResponse.fromJson(atLimit).status.length,
+        maxHealthStatusChars,
+      );
     });
 
     test('refuses an empty status', () {
@@ -96,7 +99,10 @@ void main() {
     });
 
     test('refuses an id that is not a positive integer', () {
-      for (final bad in <Object?>[0, -1, 1.0, '1', null, true]) {
+      // `1.5` and not `1.0`: on the web an integral double and an int are the
+      // same JS number, so `1.0 is int` is true there. `1.5` is non-integral on
+      // every platform, which is the shape the validator must actually refuse.
+      for (final bad in <Object?>[0, -1, 1.5, '1', null, true]) {
         final body = valid()..['project_id'] = bad;
         expect(
           malformedFrom(() => ProjectResponse.fromJson(body)).kind,
