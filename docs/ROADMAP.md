@@ -106,49 +106,46 @@ deployment remains separately approved.
   every route, including health. The tunnel is transport and authorises nothing.
 - No real client data, credentials, or production egress during verification.
 
-### Phase 5 — Flutter workstation, revision, cost, and artifacts ⬜ planned
-- 3-pane Project Explorer/Graph, Agent Canvas, and Evidence Inspector.
-- Revision comparison traced to quantity and cost variance.
-- Composite rate normalisation and confidence tracking.
-- Formula-linked Excel BOQ export with audit trail reports.
+### Phase 5A — Read-only Flutter workstation ✅
+- Flutter Web/Desktop shell with in-memory authentication only.
+- Authenticated health view and explicit single-project read view.
+- Bounded Dart DTOs matching the existing API contracts.
+- Python contract mirror tests, Flutter VM tests, Web build, and sequential
+  per-file Chrome CI verification.
+- No project creation, local data cache, or client-controlled filesystem access.
 
-### Phase 5B — server-side revision diff ✅ read-only
+### Phase 5B — Server-side revision diff ✅ read-only
 
 ```
 GET /api/v1/projects/{project_id}/revisions/diff/{base_document_id}/{target_document_id}
 ```
 
-Compares the stored evidence of two documents inside one project, under the
-bearer token and the gateway's session lock, inside one explicit read snapshot.
+Compares stored evidence for two documents in one project under bearer auth,
+the gateway session lock, and one explicit SQLite read snapshot.
 
 Delivered:
 
-- a canonical identity for an evidence row (`qsagent.revisions.canonical`) and
-  a deterministic comparison (`qsagent.revisions.diff`);
-- six outcomes: `added`, `removed`, `changed`, `unchanged`, `ambiguous`,
-  `unresolved`;
-- affected-claim association by exact evidence-reference match, plus a count of
-  the claims that could **not** be associated;
-- every list, string and count bounded, with truncation reported rather than
-  inferred;
-- the shared connection survives a diff, and a diff writes nothing: no journal
-  entry, no claim mutation, no CheckMate row, no approval consumed.
+- deterministic evidence identity and canonical comparison;
+- `added`, `removed`, `changed`, `unchanged`, `ambiguous`, and `unresolved` results;
+- bounded responses and exact evidence-reference claim association;
+- shared-connection survival and read-only guarantees;
+- no CheckMate, approval, journal, or delivery mutation.
 
-Verified inventory — what the store does not carry yet:
+Known data limitation: existing ingest paths do not consistently persist locator
+lineage on evidence nodes. The diff reports unassociated claims rather than
+matching by source hash alone. In-place re-ingest is reported as
+`evidence_unavailable`, not fabricated removals.
 
-- no ingest path passes a `ref` to `add_node`, so every provenance column on
-  `evidence_nodes` is null in production data. The diff therefore reads
-  `file_hash`, `doc_id`, `sheet` and the drawing identity out of `payload`, and
-  partitions a document's rows by `payload.doc_id` / `payload.file_hash`;
-- consequently no evidence row carries a locator, so affected claims are
-  reported as unassociated rather than matched on the source hash alone.
-  Closing that needs ingestion to record the locator on the node, or an
-  explicit claim↔node edge — Phase 5C/5D work;
-- rows written with an `ingest_key` are updated in place on re-ingest, so a
-  Mudshark re-export leaves the earlier revision with no rows of its own. That
-  is reported as `evidence_unavailable`, never as a full set of removals.
+### Phase 5C — Evidence-backed rate normalization 🟡 planning
+- Define rate contracts only after reviewing stored evidence and provenance.
+- Keep assumptions, currency, unit, source, age, quote count, and confidence
+  explicit.
+- Do not fabricate rates or add external pricing egress.
 
-Deferred: revision → cost variance, and any comparison across projects.
+### Phase 5D — Artifact/export engine ⬜ planned
+- Formula-linked Excel BOQ export with bounded, server-owned artifact handling.
+- Preserve evidence references and audit trails.
+- No arbitrary client filesystem paths or unbounded generated output.
 
 ### Phase 6 — Tender portal automation and risk engine ⬜ planned
 - EstimateOne addenda and revision notices through a separately approved crawler.
