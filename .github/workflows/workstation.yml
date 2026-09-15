@@ -65,7 +65,13 @@ jobs:
           set -euo pipefail
           while IFS= read -r -d '' file; do
             echo "--- Chrome: ${file} ---"
-            flutter test --platform chrome "${file}"
+            # `--reporter expanded` is deliberate. In Actions, Flutter switches
+            # to its GitHub-annotated reporter, and that reporter prints a
+            # failure as "Test failed. See exception logs above." with the
+            # exception itself nowhere in the captured log. Two rounds of this
+            # step failed with no readable reason. Expanded prints the assertion
+            # and the stack.
+            flutter test --platform chrome --reporter expanded "${file}"
           done < <(find test -type f -name '*_test.dart' -print0)
 
       - name: Build web
