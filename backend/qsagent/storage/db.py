@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from ..contracts.evidence import (
     ApprovalLevel,
@@ -24,6 +26,17 @@ from ..contracts.evidence import (
 )
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+
+log = logging.getLogger(__name__)
+
+
+class ReadSnapshotError(RuntimeError):
+    """A read snapshot was requested while another transaction was open.
+
+    Raised instead of committing or rolling back: the pending transaction may
+    hold writes that belong to a different operation, and a read helper has no
+    business deciding whether they survive.
+    """
 
 
 def _json(value: Any) -> str:
@@ -505,6 +518,113 @@ class QSStore:
         self.conn.commit()
         return int(cur.lastrowid)
 
+    # ---------------------------------------------------- revision inspection
+    # Phase 5B. Read-only queries used by the revision diff. Every one of them
+    # is called inside ``read_snapshot`` while the caller already holds the
+    # gateway's session lock; none writes, commits or closes anything.
+    #
+    # Truncation is reported rather than inferred: each list read asks SQLite
+    # for one row more than the bound and says whether that extra row existed,
+    # so a caller cannot mistake a clipped list for a complete one.
+
+    def get_document(
+        self, project_id: int, document_id: int
+    ) -> Optional[sqlite3.Row]:
+        """One document, scoped to its project.
+
+        ``project_id`` is part of the predicate, not a post-filter: a document
+        id belonging to another project is a miss, never a cross-project read.
+        """
+        return self.conn.execute(
+            "SELECT * FROM documents WHERE project_id=? AND id=?",
+            (int(project_id), int(document_id)),
+        ).fetchone()
+
+    def document_names_by_hash(
+        self, project_id: int, limit: int
+    ) -> dict[str, str]:
+        """``file_hash -> file_name`` for one project, bounded by *limit*.
+
+        This is the only verified filename lineage in the store: ingestion
+        passes the same name to ``add_document`` and to every ``EvidenceRef``
+        it builds. ``evidence_nodes.label`` is not a filename column - drawing
+        nodes happen to carry the file name there, quantity nodes carry
+        ``"<WBS>: <operation>"`` - so a label is never read as one.
+
+        Keys are lowercased, because a canonical identity is casefolded and a
+        lookup that missed on case would report a perfectly good reference as
+        unverifiable.
+        """
+        rows = self.conn.execute(
+            "SELECT file_hash, file_name FROM documents WHERE project_id=?"
+            " ORDER BY id LIMIT ?",
+            (int(project_id), int(limit)),
+        )
+        return {str(row["file_hash"]).lower(): row["file_name"] for row in rows}
+
+    def evidence_nodes_for_document(
+        self, project_id: int, document_id: int, file_hash: str, limit: int
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """Evidence rows belonging to one source document, plus a truncation flag.
+
+        Three ways a row is recognised as belonging to a document, in the order
+        the ingest code makes them available:
+
+        * ``payload.doc_id`` - written by every ingest path that adds a
+          document, and the only link a drawing node has;
+        * ``payload.file_hash`` - written alongside it, and the link that
+          survives when a document row is re-created;
+        * the ``file_hash`` column - null for every row the current ingest
+          writes, because no caller passes a ``ref`` to ``add_node``, but
+          consulted so a row written by a caller that does populate it is
+          still placed correctly.
+
+        ``json_valid`` guards the extraction: SQLite raises on
+        ``json_extract`` over malformed text, and one corrupt payload must
+        narrow this query's result, not fail the whole comparison.
+
+        The payload predicates cannot use an index, so this is a filtered scan
+        of one project's rows. ``limit`` bounds the result, not the scan; a
+        project with more rows than the ceiling pays for the rows it skips.
+        """
+        rows = list(self.conn.execute(
+            "SELECT * FROM evidence_nodes WHERE project_id=?"
+            "   AND ( lower(file_hash) = ?"
+            "      OR (json_valid(payload)"
+            "          AND lower(json_extract(payload, '$.file_hash')) = ?)"
+            "      OR (json_valid(payload)"
+            "          AND json_extract(payload, '$.doc_id') = ?) )"
+            " ORDER BY node_type, id LIMIT ?",
+            (
+                int(project_id),
+                str(file_hash).lower(),
+                str(file_hash).lower(),
+                int(document_id),
+                int(limit) + 1,
+            ),
+        ))
+        if len(rows) > int(limit):
+            return rows[: int(limit)], True
+        return rows, False
+
+    def claims_for_project(
+        self, project_id: int, limit: int
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """Quantity claims for one project, plus a truncation flag.
+
+        Only the two columns a revision diff needs are selected. The evidence
+        column is the claim's own JSON array of references; reading it whole is
+        what allows an exact reference match rather than a partial SQL join.
+        """
+        rows = list(self.conn.execute(
+            "SELECT claim_id, evidence FROM quantity_claims WHERE project_id=?"
+            " ORDER BY claim_id LIMIT ?",
+            (int(project_id), int(limit) + 1),
+        ))
+        if len(rows) > int(limit):
+            return rows[: int(limit)], True
+        return rows, False
+
 
 def evidence_from_row(row: sqlite3.Row) -> EvidenceRef | None:
     if not row["file_hash"]:
@@ -515,3 +635,53 @@ def evidence_from_row(row: sqlite3.Row) -> EvidenceRef | None:
         revision=row["revision"], sheet=row["sheet"], page=row["page"], zone=row["zone"],
         bbox=tuple(bbox) if bbox else None, raw_text=row["raw_text"],
     )
+
+
+@contextmanager
+def read_snapshot(store: QSStore) -> Iterator[None]:
+    """Hold one consistent read snapshot on *store*'s shared connection.
+
+    Why this exists
+    ---------------
+    A revision diff issues four separate reads - base document, target
+    document, both node sets, the project's claims - and they must all describe
+    the same instant. WAL mode allows readers to proceed while a writer
+    commits, but it grants no such thing on its own: without an explicit
+    transaction each statement is its own snapshot, so an ingest landing
+    mid-request could be seen by the first read and not by the last. The diff
+    would then report a change that never existed.
+
+    Why it is not ``with store``
+    ----------------------------
+    ``QSStore.__exit__`` calls ``close()``. This connection is the whole
+    application's connection, shared by every request, so closing it at the end
+    of one diff would take the gateway down. The snapshot therefore opens and
+    releases a transaction and nothing else.
+
+    Fail closed
+    -----------
+    If a transaction is already open, this raises rather than committing it.
+    The pending work may belong to another operation, and deciding its fate
+    from a read helper is how partial state gets persisted. ``BEGIN DEFERRED``
+    also takes its snapshot at the first read, not at the ``BEGIN``, so one
+    read is forced before the caller's code runs.
+    """
+    conn = store.conn
+    if conn.in_transaction:
+        raise ReadSnapshotError(
+            "shared store already has an open transaction; refusing to "
+            "commit or roll it back from a read snapshot"
+        )
+
+    conn.execute("BEGIN DEFERRED")
+    conn.execute("SELECT 1")
+    try:
+        yield
+    finally:
+        # Only ever unwind a transaction this helper started, and never let the
+        # release failure replace the exception that is already unwinding.
+        if conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                log.error("read snapshot: rollback failed; connection left as-is")

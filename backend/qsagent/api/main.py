@@ -88,6 +88,7 @@ from .contracts import (
 )
 from .errors import register_error_handlers
 from .limits import DEFAULT_MAX_BODY_BYTES, BodySizeLimitMiddleware
+from .revisions import register_revision_routes
 
 log = logging.getLogger(__name__)
 
@@ -760,6 +761,12 @@ def create_app(
                 model=response.model_name,
                 usage_tokens=response.usage_tokens,
             )
+
+    # ------------------------------------------------- revision intelligence
+    # Phase 5B. Read-only, so it is registered on the same authenticated router
+    # as everything else and inherits the bearer-token dependency: there is no
+    # unauthenticated revision surface to forget to protect.
+    register_revision_routes(api, store=store, sessions=sessions)
 
     app.include_router(api)
     return app

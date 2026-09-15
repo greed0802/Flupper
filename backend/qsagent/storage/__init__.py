@@ -1,3 +1,15 @@
-from .db import QSStore, JournalEntry, evidence_from_row
+from .db import (
+    QSStore,
+    JournalEntry,
+    ReadSnapshotError,
+    evidence_from_row,
+    read_snapshot,
+)
 
-__all__ = ["QSStore", "JournalEntry", "evidence_from_row"]
+__all__ = [
+    "QSStore",
+    "JournalEntry",
+    "ReadSnapshotError",
+    "evidence_from_row",
+    "read_snapshot",
+]

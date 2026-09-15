@@ -2,6 +2,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flupper_workstation/core/api_error.dart';
 import 'package:flupper_workstation/core/dto/health_response.dart';
 import 'package:flupper_workstation/core/dto/project_response.dart';
+import 'package:flupper_workstation/core/dto/revision_change.dart';
+import 'package:flupper_workstation/core/dto/revision_diff_response.dart';
 import 'package:flupper_workstation/core/dto_limits.dart';
 
 /// Runs [action] and returns the failure it raises, failing the test if none.
@@ -144,6 +146,207 @@ void main() {
         malformedFrom(() => ProjectResponse.fromJson(body)).kind,
         ApiFailureKind.malformed,
       );
+    });
+  });
+
+  group('RevisionDiffResponse', () {
+    String digest(String seed) => List<String>.filled(64, seed).join();
+
+    Map<String, Object?> evidence({int id = 1, String? rawText = 'DN600'}) =>
+        <String, Object?>{
+          'node_id': id,
+          'identity_id': digest('b'),
+          'node_type': 'drawing',
+          'label': '',
+          'drawing_no': 'C-204',
+          'revision': 'A',
+          'sheet': null,
+          'page': null,
+          'zone': null,
+          'file_hash': digest('a'),
+          'raw_text': rawText,
+          'raw_text_truncated': false,
+        };
+
+    Map<String, Object?> document({int id = 1, String revision = 'A'}) =>
+        <String, Object?>{
+          'document_id': id,
+          'file_name': 'synthetic.pdf',
+          'file_hash': digest('a'),
+          'drawing_no': 'C-204',
+          'revision': revision,
+          'evidence_rows': 1,
+          'evidence_truncated': false,
+        };
+
+    Map<String, Object?> change() => <String, Object?>{
+      'identity_id': digest('c'),
+      'status': 'changed',
+      'group_size': 1,
+      'base': evidence(),
+      'target': evidence(id: 2, rawText: 'DN900'),
+      'changed_fields': <String>['raw_text'],
+      'affected_claim_ids': <String>['Q-1'],
+      'affected_claims_omitted': 0,
+      'reason': null,
+    };
+
+    Map<String, Object?> valid() => <String, Object?>{
+      'project_id': 7,
+      'base': document(),
+      'target': document(id: 2, revision: 'B'),
+      'relationship': RevisionDiffResponse.sameDrawing,
+      'counts': <String, Object?>{
+        'added': 0,
+        'removed': 0,
+        'changed': 1,
+        'unchanged': 0,
+        'ambiguous': 0,
+        'unresolved': 0,
+      },
+      'items': <Object?>[change()],
+      'items_truncated': false,
+      'items_omitted': 0,
+      'checked_claims': 1,
+      'malformed_claims': 0,
+      'unverified_claim_references': 0,
+      'unassociated_claims': 0,
+      'warnings': <String>[],
+    };
+
+    test('parses the declared shape, nested objects included', () {
+      final diff = RevisionDiffResponse.fromJson(valid());
+      expect(diff.projectId, 7);
+      expect(diff.relationshipVerified, isTrue);
+      expect(diff.counts.changed, 1);
+      expect(diff.counts.total, 1);
+      expect(diff.counts.notComparable, 0);
+      expect(diff.items, hasLength(1));
+
+      final item = diff.items.single;
+      expect(item.status, 'changed');
+      expect(item.isChange, isTrue);
+      expect(item.needsReview, isFalse);
+      expect(item.changedFields, <String>['raw_text']);
+      expect(item.affectedClaimIds, <String>['Q-1']);
+      expect(item.base?.fileHash, digest('a'));
+      expect(item.target?.rawText, 'DN900');
+      expect(item.base?.label, '');
+      expect(diff.needsReview, isFalse);
+    });
+
+    test('accepts an empty evidence label, a value the server can send', () {
+      final item = RevisionDiffResponse.fromJson(valid()).items.single;
+      expect(item.base?.label, '');
+      expect(item.target?.label, '');
+    });
+
+    test('reads an unavailable comparison without inventing a change', () {
+      final body = valid()
+        ..['relationship'] = RevisionDiffResponse.evidenceUnavailable
+        ..['items'] = <Object?>[]
+        ..['items_truncated'] = true
+        ..['items_omitted'] = 12;
+      final diff = RevisionDiffResponse.fromJson(body);
+      expect(diff.relationshipVerified, isFalse);
+      expect(diff.items, isEmpty);
+      expect(diff.itemsTruncated, isTrue);
+      expect(diff.itemsOmitted, 12);
+      expect(diff.needsReview, isTrue);
+    });
+
+    test('refuses a missing key', () {
+      final partial = valid()..remove('counts');
+      expect(
+        malformedFrom(() => RevisionDiffResponse.fromJson(partial)).kind,
+        ApiFailureKind.malformed,
+      );
+    });
+
+    test('refuses an unknown key', () {
+      final extra = valid()..['verified'] = true;
+      expect(
+        malformedFrom(() => RevisionDiffResponse.fromJson(extra)).kind,
+        ApiFailureKind.malformed,
+      );
+    });
+
+    test('refuses a status outside the vocabulary', () {
+      final body = valid();
+      final items = body['items'] as List<Object?>;
+      (items.single as Map<String, Object?>)['status'] = 'probably-fine';
+      expect(
+        malformedFrom(() => RevisionDiffResponse.fromJson(body)).kind,
+        ApiFailureKind.malformed,
+      );
+    });
+
+    test('refuses a relationship outside the vocabulary', () {
+      final body = valid()..['relationship'] = 'probably-the-same-drawing';
+      expect(
+        malformedFrom(() => RevisionDiffResponse.fromJson(body)).kind,
+        ApiFailureKind.malformed,
+      );
+    });
+
+    test('refuses more items than the declared ceiling', () {
+      final body = valid()
+        ..['items'] = <Object?>[
+          for (var index = 0; index <= maxDiffItems; index++) change(),
+        ];
+      expect(
+        malformedFrom(() => RevisionDiffResponse.fromJson(body)).kind,
+        ApiFailureKind.malformed,
+      );
+    });
+
+    test('refuses more affected claims than the declared ceiling', () {
+      final body = valid();
+      final items = body['items'] as List<Object?>;
+      (items.single as Map<String, Object?>)['affected_claim_ids'] = <String>[
+        for (var index = 0; index <= maxDiffAffectedClaims; index++) 'Q-$index',
+      ];
+      expect(
+        malformedFrom(() => RevisionDiffResponse.fromJson(body)).kind,
+        ApiFailureKind.malformed,
+      );
+    });
+
+    test('refuses a locator longer than the server would send', () {
+      final body = valid();
+      final items = body['items'] as List<Object?>;
+      final base = (items.single as Map<String, Object?>)['base'];
+      (base as Map<String, Object?>)['raw_text'] =
+          List<String>.filled(maxDiffTextChars + 1, 'D').join();
+      expect(
+        malformedFrom(() => RevisionDiffResponse.fromJson(body)).kind,
+        ApiFailureKind.malformed,
+      );
+    });
+
+    test('refuses a nested side that is not an object', () {
+      final body = valid();
+      final items = body['items'] as List<Object?>;
+      (items.single as Map<String, Object?>)['base'] = <String>['not', 'a map'];
+      expect(
+        malformedFrom(() => RevisionDiffResponse.fromJson(body)).kind,
+        ApiFailureKind.malformed,
+      );
+    });
+
+    test('carries no fragment of a rejected value', () {
+      final body = valid();
+      final items = body['items'] as List<Object?>;
+      (items.single as Map<String, Object?>)['status'] = 'a secret status';
+      final failure = malformedFrom(() => RevisionDiffResponse.fromJson(body));
+      expect(failure.toString().contains('a secret status'), isFalse);
+    });
+
+    test('the status vocabulary is the server vocabulary', () {
+      expect(RevisionChange.statuses, hasLength(6));
+      expect(RevisionChange.statuses, contains('ambiguous'));
+      expect(RevisionChange.statuses, contains('unresolved'));
+      expect(RevisionDiffResponse.relationships, hasLength(3));
     });
   });
 

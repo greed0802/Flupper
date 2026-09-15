@@ -112,6 +112,44 @@ deployment remains separately approved.
 - Composite rate normalisation and confidence tracking.
 - Formula-linked Excel BOQ export with audit trail reports.
 
+### Phase 5B — server-side revision diff ✅ read-only
+
+```
+GET /api/v1/projects/{project_id}/revisions/diff/{base_document_id}/{target_document_id}
+```
+
+Compares the stored evidence of two documents inside one project, under the
+bearer token and the gateway's session lock, inside one explicit read snapshot.
+
+Delivered:
+
+- a canonical identity for an evidence row (`qsagent.revisions.canonical`) and
+  a deterministic comparison (`qsagent.revisions.diff`);
+- six outcomes: `added`, `removed`, `changed`, `unchanged`, `ambiguous`,
+  `unresolved`;
+- affected-claim association by exact evidence-reference match, plus a count of
+  the claims that could **not** be associated;
+- every list, string and count bounded, with truncation reported rather than
+  inferred;
+- the shared connection survives a diff, and a diff writes nothing: no journal
+  entry, no claim mutation, no CheckMate row, no approval consumed.
+
+Verified inventory — what the store does not carry yet:
+
+- no ingest path passes a `ref` to `add_node`, so every provenance column on
+  `evidence_nodes` is null in production data. The diff therefore reads
+  `file_hash`, `doc_id`, `sheet` and the drawing identity out of `payload`, and
+  partitions a document's rows by `payload.doc_id` / `payload.file_hash`;
+- consequently no evidence row carries a locator, so affected claims are
+  reported as unassociated rather than matched on the source hash alone.
+  Closing that needs ingestion to record the locator on the node, or an
+  explicit claim↔node edge — Phase 5C/5D work;
+- rows written with an `ingest_key` are updated in place on re-ingest, so a
+  Mudshark re-export leaves the earlier revision with no rows of its own. That
+  is reported as `evidence_unavailable`, never as a full set of removals.
+
+Deferred: revision → cost variance, and any comparison across projects.
+
 ### Phase 6 — Tender portal automation and risk engine ⬜ planned
 - EstimateOne addenda and revision notices through a separately approved crawler.
 - Risk register for drawing/spec conflicts, soil classification, compaction, and

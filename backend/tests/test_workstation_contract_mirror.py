@@ -21,15 +21,33 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
 from qsagent.api import create_app
 from qsagent.api.contracts import (
+    MAX_DIFF_AFFECTED_CLAIMS,
+    MAX_DIFF_CLAIM_ID_CHARS,
+    MAX_DIFF_FIELDS,
+    MAX_DIFF_HASH_CHARS,
+    MAX_DIFF_ITEMS,
+    MAX_DIFF_REASON_CHARS,
+    MAX_DIFF_SCANNED_CLAIMS,
+    MAX_DIFF_SCANNED_NODES,
+    MAX_DIFF_TEXT_CHARS,
+    MAX_DIFF_WARNINGS,
     MAX_PROJECT_NAME_CHARS,
     MAX_TASK_ID_CHARS,
+    DiffRelationship,
+    DiffStatus,
     HealthResponse,
     ProjectResponse,
+    RevisionChangeDTO,
+    RevisionDiffCountsDTO,
+    RevisionDiffResponse,
+    RevisionDocumentDTO,
+    RevisionEvidenceDTO,
 )
 from qsagent.runtime import ModelRouter
 from qsagent.storage import QSStore
@@ -43,6 +61,33 @@ TEST_TOKEN = "workstation-contract-test-token-0123456789"
 
 # The one route literal in the Dart client that is not itself a route.
 PREFIX_LITERAL = "/api/v1"
+
+# Dart interpolation -> the path parameter it stands for. A literal that
+# interpolates anything absent from this map fails loudly instead of being
+# normalised by accident.
+DART_PARAM_MAP = {
+    "$projectId": "{project_id}",
+    "$baseDocumentId": "{base_document_id}",
+    "$targetDocumentId": "{target_document_id}",
+}
+
+#: The revision diff route, spelled once so the route test and the DTO test
+#: cannot drift apart.
+REVISION_DIFF_PATH = (
+    "/api/v1/projects/{project_id}/revisions/diff/"
+    "{base_document_id}/{target_document_id}"
+)
+
+
+def _normalise_route(literal: str) -> str:
+    """Turn a Dart route literal into the path the gateway declares."""
+    candidate = literal
+    for interpolation, parameter in DART_PARAM_MAP.items():
+        candidate = candidate.replace(interpolation, parameter)
+    assert "$" not in candidate, (
+        f"{literal} interpolates something DART_PARAM_MAP does not name"
+    )
+    return candidate
 
 
 def _dart_sources() -> list[Path]:
@@ -104,6 +149,7 @@ def test_the_workstation_tree_is_present():
 def test_read_only_routes_the_client_uses_are_still_served(served_paths: set[str]):
     assert "/api/v1/health" in served_paths
     assert "/api/v1/projects/{project_id}" in served_paths
+    assert REVISION_DIFF_PATH in served_paths
 
 
 def test_the_client_uses_no_route_the_gateway_does_not_serve(served_paths: set[str]):
@@ -121,11 +167,11 @@ def test_the_client_uses_no_route_the_gateway_does_not_serve(served_paths: set[s
     for literal in literals:
         if literal.rstrip("/") == PREFIX_LITERAL:
             continue
-        candidate = literal.replace("$projectId", "{project_id}")
+        candidate = _normalise_route(literal)
         assert candidate in served_paths, f"{literal} is not a served route"
         checked += 1
 
-    assert checked >= 2, f"expected at least two routes, saw {checked}"
+    assert checked >= 3, f"expected at least three routes, saw {checked}"
 
 
 def test_dart_bounds_mirror_the_server_constants():
@@ -139,11 +185,36 @@ def test_dart_bounds_mirror_the_server_constants():
     assert constant("maxProjectNameChars") == MAX_PROJECT_NAME_CHARS
     assert constant("maxTaskIdChars") == MAX_TASK_ID_CHARS
 
+    # Phase 5B. Every one of these is a bound the gateway enforces, so a client
+    # that relaxed or tightened it would be rendering a response the server is
+    # allowed to send, or refusing one it actually sends.
+    assert constant("maxDiffItems") == MAX_DIFF_ITEMS
+    assert constant("maxDiffFields") == MAX_DIFF_FIELDS
+    assert constant("maxDiffAffectedClaims") == MAX_DIFF_AFFECTED_CLAIMS
+    assert constant("maxDiffWarnings") == MAX_DIFF_WARNINGS
+    assert constant("maxDiffTextChars") == MAX_DIFF_TEXT_CHARS
+    assert constant("maxDiffReasonChars") == MAX_DIFF_REASON_CHARS
+    assert constant("maxDiffHashChars") == MAX_DIFF_HASH_CHARS
+    assert constant("maxDiffClaimIdChars") == MAX_DIFF_CLAIM_ID_CHARS
+    assert constant("maxDiffScannedNodes") == MAX_DIFF_SCANNED_NODES
+    assert constant("maxDiffScannedClaims") == MAX_DIFF_SCANNED_CLAIMS
+
 
 def test_dart_dtos_declare_exactly_the_server_fields():
     pairs = (
         (HealthResponse, DART_LIB / "core" / "dto" / "health_response.dart"),
         (ProjectResponse, DART_LIB / "core" / "dto" / "project_response.dart"),
+        (RevisionDocumentDTO, DART_LIB / "core" / "dto" / "revision_document.dart"),
+        (RevisionEvidenceDTO, DART_LIB / "core" / "dto" / "revision_evidence.dart"),
+        (RevisionChangeDTO, DART_LIB / "core" / "dto" / "revision_change.dart"),
+        (
+            RevisionDiffCountsDTO,
+            DART_LIB / "core" / "dto" / "revision_diff_counts.dart",
+        ),
+        (
+            RevisionDiffResponse,
+            DART_LIB / "core" / "dto" / "revision_diff_response.dart",
+        ),
     )
     for model, path in pairs:
         text = _read(path)
@@ -157,6 +228,23 @@ def test_dart_dtos_declare_exactly_the_server_fields():
         # The readers must actually read those keys, or the key set is decoration.
         for field in model.model_fields:
             assert f"'{field}'" in text, f"{path.name} never reads {field}"
+
+
+def test_dart_vocabularies_mirror_the_server_literals():
+    """A status the server can send and the client cannot read is a crash."""
+    change_text = _read(DART_LIB / "core" / "dto" / "revision_change.dart")
+    statuses = re.search(r"statuses = <String>\{([^}]*)\}", change_text)
+    assert statuses, "revision_change.dart declares no status vocabulary"
+    assert set(re.findall(r"'([^']+)'", statuses.group(1))) == set(
+        get_args(DiffStatus)
+    )
+
+    response_text = _read(DART_LIB / "core" / "dto" / "revision_diff_response.dart")
+    relationships = re.search(r"relationships = <String>\{([^}]*)\}", response_text)
+    assert relationships, "revision_diff_response.dart declares no relationships"
+    assert set(re.findall(r"'([^']+)'", relationships.group(1))) == set(
+        get_args(DiffRelationship)
+    )
 
 
 def test_the_client_calls_nothing_that_would_persist_a_token():

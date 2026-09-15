@@ -9,6 +9,51 @@ import 'package:flupper_workstation/core/dto_limits.dart';
 
 import '../support/fake_transport.dart';
 
+/// A minimal, valid revision diff body.
+///
+/// Shape only. The bounds are proven in `dto_test.dart`; here it exists so a
+/// transport test can assert the URL, the method and the failure mapping.
+Map<String, Object?> revisionDiffBody({
+  String relationship = 'unverified_drawing',
+  List<Object?>? items,
+}) {
+  String digest(String seed) => List<String>.filled(64, seed).join();
+
+  Map<String, Object?> side(int id, String revision) => <String, Object?>{
+    'document_id': id,
+    'file_name': 'synthetic.pdf',
+    'file_hash': digest('a'),
+    'drawing_no': 'C-204',
+    'revision': revision,
+    'evidence_rows': 0,
+    'evidence_truncated': false,
+  };
+
+  return <String, Object?>{
+    'project_id': 42,
+    'base': side(7, 'A'),
+    'target': side(8, 'B'),
+    'relationship': relationship,
+    'counts': <String, Object?>{
+      'added': 0,
+      'removed': 0,
+      'changed': 0,
+      'unchanged': 0,
+      'ambiguous': 0,
+      'unresolved': 0,
+    },
+    'items': items ?? <Object?>[],
+    'items_truncated': false,
+    'items_omitted': 0,
+    'checked_claims': 0,
+    'malformed_claims': 0,
+    'unverified_claim_references': 0,
+    'unassociated_claims': 0,
+    'warnings': <String>['base_document_has_no_evidence_rows'],
+  };
+}
+
+
 void main() {
   final config = ApiConfig.parse('http://127.0.0.1:8000');
 
@@ -54,6 +99,53 @@ void main() {
         'http://127.0.0.1:8000/api/v1/projects/42',
       );
       expect(transport.authorizationAt(0), 'Bearer test-token');
+    });
+
+    test('GET the revision diff, with both documents and no hash in sight',
+        () async {
+      final transport = FakeTransport(
+        (_) async => jsonResponse(200, revisionDiffBody()),
+      );
+
+      await apiClient(transport).fetchRevisionDiff(
+        projectId: 42,
+        baseDocumentId: 7,
+        targetDocumentId: 8,
+        client: transport,
+      );
+
+      final url = transport.requests.single.url.toString();
+      expect(
+        url,
+        'http://127.0.0.1:8000/api/v1/projects/42/revisions/diff/7/8',
+      );
+      expect(transport.requests.single.method, 'GET');
+      expect(transport.authorizationAt(0), 'Bearer test-token');
+      // The caller names documents by id. There is no argument through which a
+      // file name, a hash or a path could be nominated.
+      expect(url.contains('hash'), isFalse);
+      expect(url.contains('..'), isFalse);
+    });
+
+    test('refuses a document id outside the declared range without sending', () {
+      final transport = FakeTransport(
+        (_) async => jsonResponse(200, <String, Object>{}),
+      );
+      final api = apiClient(transport);
+
+      for (final bad in <int>[-1, 0, maxDocumentId + 1]) {
+        expect(
+          () => api.fetchRevisionDiff(
+            projectId: 42,
+            baseDocumentId: bad,
+            targetDocumentId: 8,
+            client: transport,
+          ),
+          throwsA(failureOf(ApiFailureKind.invalidRequest)),
+          reason: '$bad',
+        );
+      }
+      expect(transport.requests, isEmpty);
     });
 
     test('reads the token per call, so a sign-out takes effect at once', () async {
@@ -132,6 +224,82 @@ void main() {
       ).fetchProject(projectId: 7, client: transport);
       expect(project.projectId, 7);
       expect(project.name, 'Example project');
+    });
+  });
+
+  group('revision diff reads', () {
+    test('an empty comparison parses, and still reports its warning', () async {
+      final transport = FakeTransport(
+        (_) async => jsonResponse(200, revisionDiffBody()),
+      );
+
+      final diff = await apiClient(transport).fetchRevisionDiff(
+        projectId: 42,
+        baseDocumentId: 7,
+        targetDocumentId: 8,
+        client: transport,
+      );
+
+      expect(diff.base.documentId, 7);
+      expect(diff.target.documentId, 8);
+      expect(diff.items, isEmpty);
+      expect(diff.relationshipVerified, isFalse);
+      expect(diff.warnings, <String>['base_document_has_no_evidence_rows']);
+      // A body with no items is not a body with no findings.
+      expect(diff.needsReview, isTrue);
+    });
+
+    test('a 404 is a not-found failure, not an empty comparison', () async {
+      final transport = FakeTransport(
+        (_) async => streamedResponse(
+          404,
+          '{"error":"HTTPException","message":"unknown project"}',
+        ),
+      );
+
+      await expectLater(
+        apiClient(transport).fetchRevisionDiff(
+          projectId: 42,
+          baseDocumentId: 7,
+          targetDocumentId: 8,
+          client: transport,
+        ),
+        throwsA(failureOf(ApiFailureKind.notFound)),
+      );
+    });
+
+    test('a 200 carrying an unknown status is malformed, not guessed at',
+        () async {
+      final transport = FakeTransport(
+        (_) async => jsonResponse(
+          200,
+          revisionDiffBody(
+            items: <Object?>[
+              <String, Object?>{
+                'identity_id': List<String>.filled(64, 'a').join(),
+                'status': 'definitely-fine',
+                'group_size': 1,
+                'base': null,
+                'target': null,
+                'changed_fields': <String>[],
+                'affected_claim_ids': <String>[],
+                'affected_claims_omitted': 0,
+                'reason': null,
+              },
+            ],
+          ),
+        ),
+      );
+
+      await expectLater(
+        apiClient(transport).fetchRevisionDiff(
+          projectId: 42,
+          baseDocumentId: 7,
+          targetDocumentId: 8,
+          client: transport,
+        ),
+        throwsA(failureOf(ApiFailureKind.malformed)),
+      );
     });
   });
 

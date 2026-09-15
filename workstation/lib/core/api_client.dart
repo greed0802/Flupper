@@ -33,6 +33,7 @@ import 'api_error.dart';
 import 'auth_storage.dart';
 import 'dto/health_response.dart';
 import 'dto/project_response.dart';
+import 'dto/revision_diff_response.dart';
 import 'dto_limits.dart';
 
 /// One error envelope, already bounded.
@@ -53,6 +54,21 @@ class ApiClient {
 
   /// `GET /api/v1/projects/{project_id}` - one project, read-only.
   static String projectPath(int projectId) => '/api/v1/projects/$projectId';
+
+  /// `GET /api/v1/projects/{project_id}/revisions/diff/{base}/{target}`.
+  ///
+  /// Two document ids and nothing else. The server resolves both sides inside
+  /// the project, so there is no way to nominate a file, a hash or a path from
+  /// here - a route that took one would be a route that trusted the caller's
+  /// provenance.
+  static String revisionDiffPath(
+    int projectId,
+    int baseDocumentId,
+    int targetDocumentId,
+  ) =>
+      // Written as one literal on purpose: a route assembled from adjacent
+      // string literals is a route the contract mirror test cannot read.
+      '/api/v1/projects/$projectId/revisions/diff/$baseDocumentId/$targetDocumentId';
 
   /// Deadline for one request, covering the send and the body read.
   static const Duration defaultRequestTimeout = Duration(seconds: 10);
@@ -90,6 +106,31 @@ class ApiClient {
       client: client,
       path: projectPath(projectId),
       parse: ProjectResponse.fromJson,
+    );
+  }
+
+  /// `GET /api/v1/projects/{projectId}/revisions/diff/{base}/{target}`.
+  ///
+  /// Every identifier is re-bounded here even though a caller validates first,
+  /// because a bound that only exists in a widget is not a bound. The three
+  /// arguments are integers and nothing else: there is no parameter through
+  /// which a caller could name a file, a hash or a path.
+  Future<RevisionDiffResponse> fetchRevisionDiff({
+    required int projectId,
+    required int baseDocumentId,
+    required int targetDocumentId,
+    required http.Client client,
+  }) {
+    final identifiers = <int>[projectId, baseDocumentId, targetDocumentId];
+    for (final identifier in identifiers) {
+      if (identifier < 1 || identifier > maxDocumentId) {
+        throw const ApiFailure(ApiFailureKind.invalidRequest);
+      }
+    }
+    return _getJson(
+      client: client,
+      path: revisionDiffPath(projectId, baseDocumentId, targetDocumentId),
+      parse: RevisionDiffResponse.fromJson,
     );
   }
 

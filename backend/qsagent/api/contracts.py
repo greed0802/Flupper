@@ -37,11 +37,47 @@ MAX_TASK_ID_CHARS = 64
 MAX_PLAN_STEPS = 1000
 MAX_NONCE_CHARS = 64
 
+# ── Phase 5B: revision diff ──────────────────────────────────────────────
+# A revision diff is read-only: its request is two integers in the path, so
+# every bound below is about the response. Each one is the ceiling on a list
+# or a string the server will emit, not a limit it hopes the store respects.
+MAX_DIFF_ITEMS = 500
+MAX_DIFF_FIELDS = 32
+MAX_DIFF_AFFECTED_CLAIMS = 50
+MAX_DIFF_WARNINGS = 8
+MAX_DIFF_TEXT_CHARS = 255
+MAX_DIFF_REASON_CHARS = 200
+#: A canonical identity is a SHA-256 digest and a claim id is its own label;
+#: both travel through this response, so both are bounded here rather than
+#: being written as literals at each use.
+MAX_DIFF_HASH_CHARS = 64
+MAX_DIFF_CLAIM_ID_CHARS = 64
+
+# ── Phase 5B: what one request may read ──────────────────────────────────
+# These bound the read where the constants above bound the answer. They are
+# here rather than in the route because they surface in the response: a row
+# count a caller is told about is a row count the caller can check.
+MAX_DIFF_SCANNED_NODES = 2000
+MAX_DIFF_SCANNED_CLAIMS = 2000
+MAX_DIFF_SCANNED_DOCUMENTS = 2000
+
 ArgvItem = Annotated[str, StringConstraints(max_length=MAX_ARGV_ITEM_CHARS)]
 
 SandboxProfileName = Literal["safe", "development"]
 SandboxNetworkPolicyName = Literal["ALLOW", "BEST_EFFORT", "BLOCK_STRICT"]
 ApprovalKind = Literal["tier3", "model"]
+DiffStatus = Literal[
+    "added", "removed", "changed", "unchanged", "ambiguous", "unresolved"
+]
+DiffRelationship = Literal[
+    "same_drawing", "unverified_drawing", "evidence_unavailable"
+]
+
+#: The two list-item kinds in a diff response. Each is bounded at its own
+#: field's length, so a list entry cannot be unbounded just because the list
+#: itself is capped.
+DiffClaimId = Annotated[str, StringConstraints(max_length=MAX_DIFF_CLAIM_ID_CHARS)]
+DiffFieldName = Annotated[str, StringConstraints(max_length=MAX_DIFF_TEXT_CHARS)]
 
 
 class _StrictModel(BaseModel):
@@ -188,3 +224,106 @@ class ModelResultResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     sandbox_root_ready: bool
+
+
+# --------------------------------------------------------------------------
+# Phase 5B - revision diff (read-only)
+# --------------------------------------------------------------------------
+class RevisionDocumentDTO(BaseModel):
+    """One side of the comparison, resolved server-side from its id.
+
+    The client sends two document ids inside a project path and nothing else:
+    no path, no hash, no filename. Everything here was read from the store, so
+    a caller cannot nominate which file is compared or claim its hash is
+    trustworthy.
+    """
+
+    document_id: int
+    file_name: str = Field(..., max_length=MAX_DIFF_TEXT_CHARS)
+    file_hash: str = Field(..., max_length=MAX_DIFF_HASH_CHARS)
+    drawing_no: str | None = Field(default=None, max_length=MAX_DIFF_TEXT_CHARS)
+    revision: str | None = Field(default=None, max_length=MAX_DIFF_TEXT_CHARS)
+    evidence_rows: int
+    evidence_truncated: bool
+
+
+class RevisionEvidenceDTO(BaseModel):
+    """One stored evidence row, as it takes part in a comparison.
+
+    Only columns that exist on ``evidence_nodes`` are described. A stored
+    ``raw_text`` longer than the bound is cut and flagged rather than dropped,
+    because a locator the reader cannot see is worse than one marked short.
+    """
+
+    node_id: int
+    identity_id: str = Field(..., max_length=MAX_DIFF_HASH_CHARS)
+    node_type: str = Field(..., max_length=MAX_DIFF_TEXT_CHARS)
+    label: str = Field(..., max_length=MAX_DIFF_TEXT_CHARS)
+    drawing_no: str | None = Field(default=None, max_length=MAX_DIFF_TEXT_CHARS)
+    revision: str | None = Field(default=None, max_length=MAX_DIFF_TEXT_CHARS)
+    sheet: str | None = Field(default=None, max_length=MAX_DIFF_TEXT_CHARS)
+    page: int | None
+    zone: str | None = Field(default=None, max_length=MAX_DIFF_TEXT_CHARS)
+    file_hash: str | None = Field(default=None, max_length=MAX_DIFF_HASH_CHARS)
+    raw_text: str | None = Field(default=None, max_length=MAX_DIFF_TEXT_CHARS)
+    raw_text_truncated: bool
+
+
+class RevisionChangeDTO(BaseModel):
+    """One classified footprint: what it is, and what a reader must check.
+
+    ``affected_claim_ids`` is the whole point of the exercise: it names the
+    claims whose stored evidence cites the base-side row, so a quantity surveyor
+    can go straight to the numbers a drawing revision put in doubt. It is
+    association only. Nothing in this response asserts a claim is still
+    correct, and nothing here changes a claim's status.
+    """
+
+    identity_id: str = Field(..., max_length=MAX_DIFF_HASH_CHARS)
+    status: DiffStatus
+    group_size: int
+    base: RevisionEvidenceDTO | None = None
+    target: RevisionEvidenceDTO | None = None
+    changed_fields: list[DiffFieldName] = Field(
+        default_factory=list, max_length=MAX_DIFF_FIELDS
+    )
+    affected_claim_ids: list[DiffClaimId] = Field(
+        default_factory=list, max_length=MAX_DIFF_AFFECTED_CLAIMS
+    )
+    affected_claims_omitted: int = 0
+    reason: str | None = Field(default=None, max_length=MAX_DIFF_REASON_CHARS)
+
+
+class RevisionDiffCountsDTO(BaseModel):
+    added: int
+    removed: int
+    changed: int
+    unchanged: int
+    ambiguous: int
+    unresolved: int
+
+
+class RevisionDiffResponse(BaseModel):
+    """A read-only comparison of two revisions of one source.
+
+    The counts are of the whole comparison; ``items`` may be shorter. When it
+    is, ``items_truncated`` is true and ``items_omitted`` says by how much, so
+    a short list is never mistaken for a complete one.
+    """
+
+    project_id: int
+    base: RevisionDocumentDTO
+    target: RevisionDocumentDTO
+    relationship: DiffRelationship
+    counts: RevisionDiffCountsDTO
+    items: list[RevisionChangeDTO] = Field(
+        default_factory=list, max_length=MAX_DIFF_ITEMS
+    )
+    items_truncated: bool
+    items_omitted: int
+    checked_claims: int
+    malformed_claims: int
+    unverified_claim_references: int
+    unassociated_claims: int
+    warnings: list[str] = Field(default_factory=list, max_length=MAX_DIFF_WARNINGS)
+
