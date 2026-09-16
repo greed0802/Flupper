@@ -677,6 +677,65 @@ class QSStore:
             return rows[: int(limit)], True
         return rows, False
 
+    # ------------------------------------------------- Phase 5D export reads
+    # Read all columns the workbook builder needs.  Separate from the Phase 5B
+    # methods above because those select a minimal column set for the diff
+    # engine while the export needs everything the workbook has to render.
+
+    def claims_for_export(
+        self, project_id: int, limit: int
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """All quantity-claim columns for one project, bounded by *limit*.
+
+        Returns a (rows, truncated) pair.  *truncated* is True when the table
+        held more rows than *limit* at query time: the caller must not interpret
+        a bounded list as a complete one.
+        """
+        rows = list(self.conn.execute(
+            "SELECT claim_id, description, value, unit, method,"
+            "       evidence, measurement_state"
+            " FROM quantity_claims WHERE project_id=?"
+            " ORDER BY claim_id LIMIT ?",
+            (int(project_id), int(limit) + 1),
+        ))
+        if len(rows) > int(limit):
+            return rows[: int(limit)], True
+        return rows, False
+
+    def assumptions_for_export(
+        self, project_id: int, limit: int
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """All assumption columns for one project, bounded by *limit*."""
+        rows = list(self.conn.execute(
+            "SELECT id, statement, status, rationale,"
+            "       impact_delta_aud, impact_value, impact_unit,"
+            "       evidence, raised_at, resolved_at"
+            " FROM assumptions WHERE project_id=?"
+            " ORDER BY id LIMIT ?",
+            (int(project_id), int(limit) + 1),
+        ))
+        if len(rows) > int(limit):
+            return rows[: int(limit)], True
+        return rows, False
+
+    def checkmate_for_export(
+        self, project_id: int, limit: int
+    ) -> tuple[list[sqlite3.Row], bool]:
+        """Latest CheckMate results for one project, bounded by *limit*.
+
+        Ordered by id descending so the most recent results come first.
+        The workbook builder reads all of them to derive the gate status.
+        """
+        rows = list(self.conn.execute(
+            "SELECT subject, passed, findings, created_at"
+            " FROM checkmate_results WHERE project_id=?"
+            " ORDER BY id DESC LIMIT ?",
+            (int(project_id), int(limit) + 1),
+        ))
+        if len(rows) > int(limit):
+            return rows[: int(limit)], True
+        return rows, False
+
 
 def evidence_from_row(row: sqlite3.Row) -> EvidenceRef | None:
     if not row["file_hash"]:

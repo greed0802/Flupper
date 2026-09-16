@@ -9,6 +9,16 @@ Rules (same as the rest of contracts.py):
 * ``extra="forbid"`` on every model — no key smuggling.
 * Every string and list is explicitly bounded.
 * No credential field anywhere.
+
+Rate binding design
+-------------------
+A caller supplies a *reference* to a stored rate node (a ``rate_node_id``),
+not a numeric rate.  The route reads the ``normalized_amount`` for that node
+out of the store, scoped to the caller's project, and uses that stored number
+to populate the workbook.  A client that cannot supply a numeric rate and have
+it accepted cannot nominate its own arithmetic as an authoritative evidenced
+rate; the only source of truth for any amount is the store's own normalizer
+output.
 """
 
 from __future__ import annotations
@@ -29,19 +39,32 @@ from .bounds import (
 # Sub-models
 # --------------------------------------------------------------------------
 
-class RateBinding(BaseModel):
-    """Caller-supplied pairing of a claim id to a rate value.
+#: A positive integer — the ``id`` column of an ``evidence_nodes`` row that
+#: carries a normalised rate payload.  Must be >= 1; 0 is never a valid SQLite
+#: rowid, and negative values are nonsensical.  The route validates that the
+#: id belongs to the request's project before any read; an id from another
+#: project is treated as missing.
+PositiveRateNodeId = Annotated[int, Field(ge=1)]
 
-    The rate value is a plain number — AUD per unit — resolved from stored
-    rate nodes upstream and passed through here. The route trusts the
-    arithmetic only after CheckMate has cleared it; this model enforces the
-    shape, not the provenance.
+
+class RateBinding(BaseModel):
+    """Pairing of a claim id to a *server-issued* rate node id.
+
+    The caller names two server-held identifiers and nothing else — there is
+    no field for a numeric amount, a unit, a currency or a category.  The
+    route reads the ``normalized_amount`` for ``rate_node_id`` out of the
+    store (scoped to the caller's project) and places that stored number into
+    the workbook.
+
+    A client cannot submit an authoritative rate by naming a node id that
+    carries a different amount than the one it knows about: the store is the
+    only source of truth.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     claim_id: Annotated[str, Field(min_length=1, max_length=MAX_EXPORT_TEXT_CHARS)]
-    rate_aud: Annotated[float, Field(ge=0.0, le=1e12)]
+    rate_node_id: PositiveRateNodeId
 
 
 class ArtifactRef(BaseModel):

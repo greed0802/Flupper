@@ -3,24 +3,36 @@
 Design constraints
 ------------------
 * Thread-safe for concurrent route access via a single ``threading.Lock``.
-* No disk I/O inside the registry — the bytes live in memory; the caller
-  decides whether to also write them to a temp file.
-* Eviction is passive (on read / list) plus active (a background daemon thread
-  that wakes every ``ARTIFACT_CLEANUP_INTERVAL_SECONDS``).  Either path calls
-  the same ``_evict()`` helper, so the logic lives once.
-* The registry holds no reference to the FastAPI app or the store. It is
-  created by `create_app` and hung on ``app.state.artifacts``; the route
-  pulls it from there.
+* No disk I/O inside the registry — bytes live in memory only.
+* Passive eviction on every read/list call plus active eviction via a
+  FastAPI lifespan-owned asyncio task from :meth:`async_cleanup_task`.
+* The registry holds no reference to the FastAPI app or the store.
+
+Lifecycle (asyncio path — approved architecture)
+------------------------------------------------
+The cleanup task is owned by the FastAPI lifespan::
+
+    task = asyncio.create_task(registry.async_cleanup_task())
+    # … yield …
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+Test-only synchronous path
+--------------------------
+``start_cleanup()`` / ``stop_cleanup()`` use a daemon thread.
+Do **not** call them in production code.
 
 Artifact ids
 ------------
-UUID4 canonical strings — 36 chars, checked at registration and at access.
-The registry refuses an id that is not exactly 36 characters so no caller can
-probe ``/artifacts/../../etc`` through a crafted parameter.
+UUID4 canonical strings — 36 chars, enforced at registration and access.
 """
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 import uuid
@@ -37,26 +49,13 @@ from .bounds import (
 
 @dataclass
 class ArtifactEntry:
-    """One artifact stored in the registry.
-
-    Attributes
-    ----------
-    artifact_id:
-        UUID4 canonical string (36 chars).
-    media_type:
-        MIME type for the ``Content-Type`` header on download.
-    data:
-        Raw bytes of the artifact; bounded by :data:`~.bounds.MAX_EXPORT_BYTES`.
-    expires_at:
-        ``time.monotonic()`` timestamp after which this entry is stale.
-    created_at:
-        ``time.monotonic()`` timestamp at registration (for age calculation).
-    """
+    """One artifact stored in the registry."""
 
     artifact_id: str
     media_type: str
     data: bytes
     expires_at: float
+    project_id: int
     created_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -72,23 +71,9 @@ class ArtifactEntry:
         return len(self.data)
 
 
+
 class ArtifactRegistry:
-    """Thread-safe, TTL-bounded in-memory artifact store.
-
-    Usage
-    -----
-    ::
-
-        registry = ArtifactRegistry()
-        registry.start_cleanup()          # starts background eviction thread
-
-        artifact_id = registry.register(data, media_type="application/...")
-        entry = registry.get(artifact_id) # None if expired or unknown
-        registry.delete(artifact_id)
-
-    The cleanup thread is a daemon, so it does not prevent process exit.  Call
-    :meth:`stop_cleanup` in tests that need a clean teardown.
-    """
+    """Thread-safe, TTL-bounded in-memory artifact store."""
 
     def __init__(
         self,
@@ -100,19 +85,23 @@ class ArtifactRegistry:
         self._ttl = float(ttl_seconds)
         self._cleanup_interval = float(cleanup_interval)
         self._max_bytes = int(max_bytes)
-
         self._lock = threading.Lock()
         self._store: dict[str, ArtifactEntry] = {}
-
         self._stop_event = threading.Event()
         self._cleanup_thread: threading.Thread | None = None
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    async def async_cleanup_task(self) -> None:
+        """Lifespan-owned coroutine. Cancelled by the lifespan on shutdown."""
+        try:
+            while True:
+                await asyncio.sleep(self._cleanup_interval)
+                with self._lock:
+                    self._evict()
+        except asyncio.CancelledError:
+            raise
 
     def start_cleanup(self) -> None:
-        """Start the background eviction daemon. Idempotent."""
+        """Start daemon eviction thread. **Test use only.**"""
         with self._lock:
             if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
                 return
@@ -126,30 +115,24 @@ class ArtifactRegistry:
             self._cleanup_thread = t
 
     def stop_cleanup(self) -> None:
-        """Signal the background thread to stop and join it (for tests)."""
+        """Stop daemon eviction thread. **Test use only.**"""
         self._stop_event.set()
         with self._lock:
             t = self._cleanup_thread
         if t is not None:
             t.join(timeout=self._cleanup_interval + 1.0)
 
-    # ------------------------------------------------------------------
-    # Core API
-    # ------------------------------------------------------------------
-
     def register(
         self,
         data: bytes,
         *,
         media_type: str,
+        project_id: int,
         ttl_seconds: float | None = None,
     ) -> str:
-        """Store *data* and return a fresh UUID4 artifact id.
+        """Store bytes and return a UUID4 artifact id.
 
-        Raises
-        ------
-        ValueError
-            If ``len(data) > max_bytes``.
+        Raises ValueError if len(data) > max_bytes.
         """
         if len(data) > self._max_bytes:
             raise ValueError(
@@ -162,14 +145,17 @@ class ArtifactRegistry:
             media_type=media_type,
             data=data,
             expires_at=time.monotonic() + ttl,
+            project_id=int(project_id),
         )
         with self._lock:
             self._evict()
             self._store[artifact_id] = entry
         return artifact_id
 
-    def get(self, artifact_id: str) -> ArtifactEntry | None:
-        """Return the entry or ``None`` if absent, unknown or expired."""
+    def get(
+        self, artifact_id: str, *, project_id: int | None = None
+    ) -> ArtifactEntry | None:
+        """Return entry or None if absent, expired, or wrong project."""
         if len(artifact_id) != ARTIFACT_ID_CHARS:
             return None
         with self._lock:
@@ -177,10 +163,11 @@ class ArtifactRegistry:
             entry = self._store.get(artifact_id)
         if entry is None or entry.expired:
             return None
+        if project_id is not None and entry.project_id != int(project_id):
+            return None
         return entry
 
     def delete(self, artifact_id: str) -> bool:
-        """Remove one entry. Returns ``True`` if it existed."""
         with self._lock:
             return self._store.pop(artifact_id, None) is not None
 
@@ -190,25 +177,24 @@ class ArtifactRegistry:
             return len(self._store)
 
     def __iter__(self) -> Iterator[ArtifactEntry]:
-        """Iterate live (non-expired) entries under the lock."""
         with self._lock:
             self._evict()
             yield from list(self._store.values())
 
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
     def _evict(self) -> None:
-        """Remove expired entries. MUST be called under ``self._lock``."""
-        now = time.monotonic()
-        dead = [k for k, v in self._store.items() if now >= v.expires_at]
+        dead = [k for k, v in self._store.items() if v.expired]
         for k in dead:
             del self._store[k]
 
     def _cleanup_loop(self) -> None:
-        """Background daemon: sleep, evict, repeat."""
         while not self._stop_event.wait(timeout=self._cleanup_interval):
             with self._lock:
                 self._evict()
 
+    @property
+    def age_seconds(self) -> float:
+        return time.monotonic() - self.created_at
+
+    @property
+    def bytes_len(self) -> int:
+        return len(self.data)

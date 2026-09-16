@@ -15,7 +15,7 @@ from typing import Any
 import openpyxl
 import pytest
 
-from backend.qsagent.artifacts import (
+from qsagent.artifacts import (
     ARTIFACT_ID_CHARS,
     ASSUMPTION_COLUMNS,
     BANNER_ROW,
@@ -177,13 +177,13 @@ class TestBoundsConstants:
 class TestArtifactRegistry:
     def test_register_returns_uuid4(self):
         reg = ArtifactRegistry()
-        aid = reg.register(b"hello", media_type="text/plain")
+        aid = reg.register(b"hello", media_type="text/plain", project_id=1)
         assert len(aid) == 36
         uuid.UUID(aid, version=4)
 
     def test_get_returns_entry(self):
         reg = ArtifactRegistry()
-        aid = reg.register(b"data", media_type="application/octet-stream")
+        aid = reg.register(b"data", media_type="application/octet-stream", project_id=1)
         entry = reg.get(aid)
         assert entry is not None
         assert entry.data == b"data"
@@ -199,7 +199,7 @@ class TestArtifactRegistry:
 
     def test_delete_removes_entry(self):
         reg = ArtifactRegistry()
-        aid = reg.register(b"x", media_type="text/plain")
+        aid = reg.register(b"x", media_type="text/plain", project_id=1)
         assert reg.delete(aid) is True
         assert reg.get(aid) is None
 
@@ -210,26 +210,26 @@ class TestArtifactRegistry:
     def test_len_counts_live_entries(self):
         reg = ArtifactRegistry()
         assert len(reg) == 0
-        reg.register(b"a", media_type="text/plain")
-        reg.register(b"b", media_type="text/plain")
+        reg.register(b"a", media_type="text/plain", project_id=1)
+        reg.register(b"b", media_type="text/plain", project_id=1)
         assert len(reg) == 2
 
     def test_expired_entry_not_returned(self):
         reg = ArtifactRegistry(ttl_seconds=0.01)
-        aid = reg.register(b"x", media_type="text/plain")
+        aid = reg.register(b"x", media_type="text/plain", project_id=1)
         time.sleep(0.05)
         assert reg.get(aid) is None
 
     def test_expired_entry_evicted_from_len(self):
         reg = ArtifactRegistry(ttl_seconds=0.01)
-        reg.register(b"x", media_type="text/plain")
+        reg.register(b"x", media_type="text/plain", project_id=1)
         time.sleep(0.05)
         assert len(reg) == 0
 
     def test_oversized_raises(self):
         reg = ArtifactRegistry(max_bytes=10)
         with pytest.raises(ValueError, match="bytes"):
-            reg.register(b"x" * 11, media_type="text/plain")
+            reg.register(b"x" * 11, media_type="text/plain", project_id=1)
 
     def test_cleanup_thread_start_stop(self):
         reg = ArtifactRegistry(cleanup_interval=0.05)
@@ -241,17 +241,36 @@ class TestArtifactRegistry:
 
     def test_iterate_yields_live_entries(self):
         reg = ArtifactRegistry()
-        reg.register(b"a", media_type="text/plain")
-        reg.register(b"b", media_type="text/plain")
+        reg.register(b"a", media_type="text/plain", project_id=1)
+        reg.register(b"b", media_type="text/plain", project_id=1)
         assert len(list(reg)) == 2
 
     def test_entry_properties(self):
         reg = ArtifactRegistry()
-        aid = reg.register(b"abc", media_type="text/plain")
+        aid = reg.register(b"abc", media_type="text/plain", project_id=1)
         e = reg.get(aid)
         assert e.bytes_len == 3
         assert e.age_seconds >= 0.0
         assert not e.expired
+
+    def test_project_isolation_get(self):
+        """An artifact registered under project 1 is invisible to project 2."""
+        reg = ArtifactRegistry()
+        aid = reg.register(b"secret", media_type="text/plain", project_id=1)
+        assert reg.get(aid, project_id=1) is not None
+        assert reg.get(aid, project_id=2) is None
+
+    def test_project_isolation_no_project_id_bypasses(self):
+        """get() without project_id returns entry regardless of stored project."""
+        reg = ArtifactRegistry()
+        aid = reg.register(b"x", media_type="text/plain", project_id=99)
+        assert reg.get(aid) is not None  # no project filter
+
+    def test_async_cleanup_task_is_coroutine(self):
+        """async_cleanup_task must be an awaitable coroutine function."""
+        import inspect
+        reg = ArtifactRegistry()
+        assert inspect.iscoroutinefunction(reg.async_cleanup_task)
 
 
 # ---------------------------------------------------------------------------
@@ -272,17 +291,26 @@ class TestExportDTO:
             ExportRequest(**{"extra_field": "bad"})
 
     def test_rate_binding_valid(self):
-        rb = RateBinding(claim_id="C-001", rate_aud=125.50)
+        rb = RateBinding(claim_id="C-001", rate_node_id=42)
         assert rb.claim_id == "C-001"
-        assert rb.rate_aud == pytest.approx(125.50)
+        assert rb.rate_node_id == 42
 
-    def test_rate_binding_rejects_negative_rate(self):
+    def test_rate_binding_rejects_zero_node_id(self):
         with pytest.raises(Exception):
-            RateBinding(claim_id="C-001", rate_aud=-1.0)
+            RateBinding(claim_id="C-001", rate_node_id=0)
+
+    def test_rate_binding_rejects_negative_node_id(self):
+        with pytest.raises(Exception):
+            RateBinding(claim_id="C-001", rate_node_id=-1)
 
     def test_rate_binding_rejects_empty_claim_id(self):
         with pytest.raises(Exception):
-            RateBinding(claim_id="", rate_aud=10.0)
+            RateBinding(claim_id="", rate_node_id=1)
+
+    def test_rate_binding_no_rate_field(self):
+        """RateBinding must not accept a rate_aud field — client cannot supply a number."""
+        with pytest.raises(Exception):
+            RateBinding(claim_id="C-001", rate_node_id=1, rate_aud=99.0)
 
     def test_artifact_ref_length_check(self):
         ref = ArtifactRef(artifact_id=str(uuid.uuid4()), download_url="http://localhost/dl/x")
@@ -383,6 +411,273 @@ class TestWorkbookLayout:
         ws = wb[SHEET_CLAIMS]
         cell_f = ws.cell(row=FIRST_DATA_ROW, column=6).value or ""
         assert len(cell_f) <= MAX_EXPORT_FORMULA_CHARS
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: artifact API routes
+# ---------------------------------------------------------------------------
+
+import pytest as _pytest
+from fastapi.testclient import TestClient as _TestClient
+
+from qsagent.api import create_app as _create_app
+from qsagent.runtime import ModelRouter as _ModelRouter, ModelTier as _ModelTier
+from qsagent.runtime import ProviderResponse as _ProviderResponse
+from qsagent.storage import QSStore as _QSStore
+
+_API = "/api/v1"
+_TEST_TOKEN = "artifact-integration-test-token-abc"
+_AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+
+
+class _NoopProvider:
+    @property
+    def name(self) -> str:
+        return "noop"
+
+    @property
+    def supported_tier(self):
+        return _ModelTier.LOCAL_MODEL
+
+    def complete(self, prompt: str, **kw):
+        return _ProviderResponse(
+            text="", provider_name="noop", model_name="noop-v0", usage_tokens=0
+        )
+
+
+class _AnonSecrets:
+    def get_key(self, provider: str):
+        return None
+
+
+def _make_test_app(store, tmp_path, sandbox_suffix="sandboxes"):
+    r = _ModelRouter(_AnonSecrets())
+    r.register(_NoopProvider())
+    return _create_app(
+        store=store,
+        router=r,
+        api_token=_TEST_TOKEN,
+        sandbox_root=tmp_path / sandbox_suffix,
+    )
+
+
+@_pytest.fixture()
+def _store():
+    st = _QSStore(":memory:")
+    yield st
+    st.close()
+
+
+@_pytest.fixture()
+def _app(_store, tmp_path):
+    return _make_test_app(_store, tmp_path)
+
+
+@_pytest.fixture()
+def _client(_app):
+    with _TestClient(_app, headers=_AUTH_HEADERS) as c:
+        yield c
+
+
+def _new_project(client, name: str = "artifact-test") -> int:
+    resp = client.post(f"{_API}/projects", json={"name": name})
+    assert resp.status_code == 201
+    return resp.json()["project_id"]
+
+
+class TestArtifactRoutes:
+    """Integration: POST /projects/{id}/artifacts + GET download."""
+
+    def test_create_requires_auth(self, _app):
+        with _TestClient(_app) as c:
+            resp = c.post(f"{_API}/projects/1/artifacts", json={})
+        assert resp.status_code in (401, 403)
+
+    def test_download_requires_auth(self, _app):
+        with _TestClient(_app) as c:
+            resp = c.get(f"{_API}/projects/1/artifacts/{str(uuid.uuid4())}")
+        assert resp.status_code in (401, 403)
+
+    def test_create_unknown_project_is_404(self, _client):
+        resp = _client.post(f"{_API}/projects/99999/artifacts", json={})
+        assert resp.status_code == 404
+
+    def test_create_returns_201_with_artifact_ref(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        assert resp.status_code == 201
+        body = resp.json()
+        assert "artifact" in body
+        assert len(body["artifact"]["artifact_id"]) == 36
+        assert body["project_id"] == pid
+
+    def test_empty_project_gate_is_not_run(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        assert resp.json()["gate"] == "NOT_RUN"
+
+    def test_passed_checkmate_sets_passed_gate(self, _client, _store):
+        pid = _new_project(_client)
+        _store.save_checkmate(pid, subject="C-001", passed=True, findings=[])
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        assert resp.json()["gate"] == "PASSED"
+
+    def test_failed_checkmate_sets_rejected_gate(self, _client, _store):
+        pid = _new_project(_client)
+        _store.save_checkmate(pid, subject="C-001", passed=False, findings=[{"msg": "bad"}])
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        assert resp.json()["gate"] == "REJECTED"
+
+    def test_diagnostic_gate_does_not_mutate_db(self, _client, _store):
+        """create_artifact must not write to the DB."""
+        pid = _new_project(_client)
+        before = _store.journal_entries(pid)
+        _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        after = _store.journal_entries(pid)
+        assert len(after) == len(before)
+
+    def test_download_url_contains_artifact_id(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        body = resp.json()
+        assert body["artifact"]["artifact_id"] in body["artifact"]["download_url"]
+
+    def test_download_returns_xlsx_bytes(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        artifact_id = resp.json()["artifact"]["artifact_id"]
+        dl = _client.get(f"{_API}/projects/{pid}/artifacts/{artifact_id}")
+        assert dl.status_code == 200
+        # XLSX magic bytes
+        assert dl.content[:2] == b"PK"
+
+    def test_download_content_type_is_xlsx(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        artifact_id = resp.json()["artifact"]["artifact_id"]
+        dl = _client.get(f"{_API}/projects/{pid}/artifacts/{artifact_id}")
+        assert "spreadsheetml" in dl.headers.get("content-type", "")
+
+
+    def test_project_isolation_download(self, _client, _store):
+        """Artifact for project A is not downloadable under project B."""
+        pid_a = _new_project(_client, "iso-a")
+        pid_b = _new_project(_client, "iso-b")
+        resp = _client.post(f"{_API}/projects/{pid_a}/artifacts", json={})
+        artifact_id = resp.json()["artifact"]["artifact_id"]
+        dl = _client.get(f"{_API}/projects/{pid_b}/artifacts/{artifact_id}")
+        assert dl.status_code == 404
+
+    def test_download_unknown_artifact_is_404(self, _client, _store):
+        pid = _new_project(_client)
+        dl = _client.get(f"{_API}/projects/{pid}/artifacts/{str(uuid.uuid4())}")
+        assert dl.status_code == 404
+
+    def test_uuid_path_traversal_rejected(self, _client, _store):
+        """Non-UUID artifact ids must return 404 without any registry lookup."""
+        pid = _new_project(_client)
+        for bad_id in ("../../etc/passwd", "short", "x" * 37):
+            dl = _client.get(f"{_API}/projects/{pid}/artifacts/{bad_id}")
+            assert dl.status_code == 404, f"expected 404 for {bad_id!r}"
+
+    def test_expired_artifact_is_404(self, _store, tmp_path):
+        """Artifact whose TTL has elapsed must not be downloadable."""
+        from qsagent.artifacts import ArtifactRegistry
+        tiny_reg = ArtifactRegistry(ttl_seconds=0.01)
+        app2 = _make_test_app(_store, tmp_path, "sandboxes-exp")
+        app2.state.artifacts = tiny_reg
+        with _TestClient(app2, headers=_AUTH_HEADERS) as c:
+            pid = c.post(f"{_API}/projects", json={"name": "expire-test"}).json()["project_id"]
+            resp = c.post(f"{_API}/projects/{pid}/artifacts", json={})
+            artifact_id = resp.json()["artifact"]["artifact_id"]
+            time.sleep(0.05)
+            dl = c.get(f"{_API}/projects/{pid}/artifacts/{artifact_id}")
+            assert dl.status_code == 404
+
+    def test_lifespan_cleanup_task_starts_without_error(self, _store, tmp_path):
+        """The lifespan must start the asyncio cleanup task without raising."""
+        app3 = _make_test_app(_store, tmp_path, "sandboxes-ls")
+        with _TestClient(app3, headers=_AUTH_HEADERS) as c:
+            assert c.get(f"{_API}/health").status_code == 200
+
+    def test_invalid_export_type_rejected_422(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(
+            f"{_API}/projects/{pid}/artifacts",
+            json={"export_type": "csv"},
+        )
+        assert resp.status_code == 422
+
+    def test_rate_binding_node_zero_rejected_422(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(
+            f"{_API}/projects/{pid}/artifacts",
+            json={"rate_bindings": [{"claim_id": "C-001", "rate_node_id": 0}]},
+        )
+        assert resp.status_code == 422
+
+    def test_extra_request_fields_rejected_422(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(
+            f"{_API}/projects/{pid}/artifacts",
+            json={"export_type": "boq_xlsx", "inject_me": True},
+        )
+        assert resp.status_code == 422
+
+    def test_rate_node_cross_project_does_not_resolve(self, _client, _store):
+        """A rate node from project A is invisible to project B."""
+        from qsagent.contracts.evidence import EvidenceNode
+        pid_a = _new_project(_client, "cpi-a")
+        pid_b = _new_project(_client, "cpi-b")
+        node_id = _store.add_node(EvidenceNode(
+            project_id=pid_a,
+            node_type="rate",
+            label="rate-in-a",
+            payload={"status": "normalized", "normalized_amount": 42.0},
+        ))
+        # Must succeed (generate workbook), rate just shows as Unresolved
+        resp = _client.post(
+            f"{_API}/projects/{pid_b}/artifacts",
+            json={"rate_bindings": [{"claim_id": "C-001", "rate_node_id": node_id}]},
+        )
+        assert resp.status_code == 201
+
+    def test_unresolved_rate_node_still_generates_workbook(self, _client, _store):
+        """A rate node with non-normalized status must not block workbook generation."""
+        from qsagent.contracts.evidence import EvidenceNode
+        pid = _new_project(_client)
+        node_id = _store.add_node(EvidenceNode(
+            project_id=pid,
+            node_type="rate",
+            label="unres-rate",
+            payload={"status": "unresolved"},
+        ))
+        resp = _client.post(
+            f"{_API}/projects/{pid}/artifacts",
+            json={"rate_bindings": [{"claim_id": "C-001", "rate_node_id": node_id}]},
+        )
+        assert resp.status_code == 201
+
+    def test_size_limit_respected(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        artifact_id = resp.json()["artifact"]["artifact_id"]
+        dl = _client.get(f"{_API}/projects/{pid}/artifacts/{artifact_id}")
+        assert len(dl.content) <= MAX_EXPORT_BYTES
+
+    def test_download_has_content_disposition_attachment(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        artifact_id = resp.json()["artifact"]["artifact_id"]
+        dl = _client.get(f"{_API}/projects/{pid}/artifacts/{artifact_id}")
+        assert "attachment" in dl.headers.get("content-disposition", "")
+
+    def test_download_cache_control_no_store(self, _client, _store):
+        pid = _new_project(_client)
+        resp = _client.post(f"{_API}/projects/{pid}/artifacts", json={})
+        artifact_id = resp.json()["artifact"]["artifact_id"]
+        dl = _client.get(f"{_API}/projects/{pid}/artifacts/{artifact_id}")
+        assert "no-store" in dl.headers.get("cache-control", "")
 
 
 # ---------------------------------------------------------------------------

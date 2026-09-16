@@ -32,14 +32,15 @@ response. The comparison is constant-time.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import secrets
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import AsyncIterator, Iterator, Sequence
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -90,6 +91,8 @@ from .errors import register_error_handlers
 from .limits import DEFAULT_MAX_BODY_BYTES, BodySizeLimitMiddleware
 from .rates import register_rate_routes
 from .revisions import register_revision_routes
+from .artifacts import register_artifact_routes
+from ..artifacts import ArtifactRegistry
 
 log = logging.getLogger(__name__)
 
@@ -437,10 +440,31 @@ def create_app(
 
     sessions = SessionRegistry()
     approvals = ApprovalRegistry(ttl_seconds=approval_ttl_seconds)
+    artifact_registry = ArtifactRegistry()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Own the artifact cleanup task for the full server lifetime.
+
+        ``asyncio.create_task`` schedules the coroutine on the running event
+        loop.  On shutdown the task is cancelled and awaited so the loop does
+        not exit with a pending task warning.  ``CancelledError`` is swallowed
+        here - it is the normal shutdown path, not a bug.
+        """
+        task = asyncio.create_task(artifact_registry.async_cleanup_task())
+        try:
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(
         title="Flupper Local Gateway",
         version="0.1.0",
+        lifespan=lifespan,
         # Docs and the OpenAPI schema are disabled on purpose. This surface
         # executes processes, so every route should be reached through the
         # workstation that implements the approval handshake rather than through
@@ -454,6 +478,7 @@ def create_app(
     app.state.sandbox_root = root
     app.state.sessions = sessions
     app.state.approvals = approvals
+    app.state.artifacts = artifact_registry
     # Held on the app rather than in a module global so two apps built in one
     # process - which is exactly what the test suite does - cannot authenticate
     # each other's callers.
@@ -774,6 +799,18 @@ def create_app(
     # reason: on the authenticated router, so there is no rate surface outside
     # the bearer-token dependency to forget about.
     register_rate_routes(api, store=store, sessions=sessions)
+
+    # ------------------------------------------------------- artifact export
+    # Phase 5D. Authenticated by the same router dependency. The ArtifactRegistry
+    # is created by the factory and its lifespan cleanup task is owned by the
+    # asyncio lifespan above.
+    register_artifact_routes(
+        api,
+        store=store,
+        sessions=sessions,
+        artifacts=artifact_registry,
+        api_prefix=API_PREFIX,
+    )
 
     app.include_router(api)
     return app
