@@ -24,8 +24,8 @@ every response passes the **QS CheckMate** gate before it reaches a human.
 | 4C | Controlled Cloudflare Tunnel exposure | ✅ implementation complete — synthetic/local verification only |
 | 5A | Read-only Flutter workstation shell | ✅ complete; Chrome verified in CI |
 | 5B | Read-only server-side revision diff | ✅ complete |
-| 5C | Evidence-backed rate normalization | 🟡 planning |
-| 5D | Artifact/export engine | ⬜ planned |
+| 5C | Evidence-backed rate normalization | ✅ complete, read-only |
+| 5D | Artifact/export engine | ✅ complete, temporary bounded export |
 | 6 | Tender portal automation and risk engine | ⬜ planned |
 
 Phase 4A/4B remain local and single-worker. The API binds to `127.0.0.1`,
@@ -46,8 +46,8 @@ python3 -m venv .venv
 Current verified Python baseline for the Phase 5B commit:
 
 ```text
-Repo root: 487 collected, 485 passed, 2 skipped
-backend/:  487 collected, 485 passed, 2 skipped
+Repo root: 743 collected, 741 passed, 2 skipped
+backend/:  743 collected, 741 passed, 2 skipped
 ```
 
 The skips are environment-bound: the tunnel connector test requires `cloudflared`,

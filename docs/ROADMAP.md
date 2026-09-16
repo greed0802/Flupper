@@ -51,7 +51,7 @@ The real tunnel hostname is owner-controlled and supplied out-of-band through
 | Knowledge Graph | Relational tender model | ✅ Phase 2 |
 | Local API Gateway | Bounded, authenticated lifecycle API | ✅ Phases 4A–4B |
 | Controlled Tunnel | Explicit loopback-only public transport | ✅ Phase 4C |
-| Flutter Workstation | Project, agent, and evidence client | ⬜ planned |
+| Flutter Workstation | Read-only client shell and tablet trial | ✅ 5A shell; tablet trial planned |
 
 ## Phases
 
@@ -137,54 +137,24 @@ matching by source hash alone. In-place re-ingest is reported as
 `evidence_unavailable`, not fabricated removals.
 
 ### Phase 5C — Evidence-backed rate normalization ✅ read-only
+- Authenticated, project-scoped rate proposal endpoint over stored rate nodes.
+- Decimal-string normalization, explicit AUD/canonical-unit rules, bounded output,
+  unresolved evidence states, and no persistence or external pricing egress.
+- Client-supplied numeric rates are not trusted; the server resolves rate nodes.
 
-```
-POST /api/v1/projects/{project_id}/rates/proposals/normalize
-```
+### Phase 5D — Artifact/export engine ✅ bounded temporary export
+- Authenticated temporary `boq_xlsx` artifact creation and download routes.
+- Server-owned run directories, in-memory registry, TTL cleanup, bounded 5 MB
+  downloads, project isolation, and lifespan-owned cleanup.
+- Formula-safe workbook generation with explicit diagnostic/non-deliverable gates.
+- No master BOQ writes, arbitrary client paths, external links, macros, or secrets.
 
-Turns stored `rate` evidence rows into normalized rate proposals under bearer
-auth, the gateway session lock, and one explicit SQLite read snapshot. The
-request carries node ids and nothing else: there is no field for an amount, a
-unit, a currency, a category, a hash or a path, so a caller cannot assert what a
-rate is or nominate the proof for one.
-
-Delivered:
-
-- a closed payload schema — `amount`, `unit`, `currency`, `rate_category`,
-  `effective_date`, `provenance`, the `doc_id`/`file_hash` source link and the
-  locator keys; an unexpected key is a refusal, not a field to look around;
-- closed unit, currency and category sets, plus explicit category-to-unit
-  compatibility: `crates`, `USD`, `$` and `R/hr` for a cart-away are all
-  `unresolved` rather than mapped onto something plausible;
-- money as `Decimal` from parse to serialization, quantized once to two places
-  with `ROUND_HALF_UP` and rendered as a decimal string, so no `float` and no
-  JSON number can change a rate in transit;
-- source resolution against `documents` inside the project — the hash and file
-  name in a proposal were read out of the store, never echoed from a payload;
-- `exact` requires a machine export and a locator; anything else that still has
-  a verifiable source is `inferred` with the missing piece named in `warnings`;
-- duplicate quotes of one source and category are flagged rather than picked
-  between, and a request that names an id outside the project fails whole rather
-  than answering in part;
-- bounded request (positive strict integer ids, at most 100, deduplicated) and
-  bounded response; no writes, no journal entry, no CheckMate row, no approval
-  consumption, no quantity-claim change.
-
-No escalation, inflation or FX is applied. A rate older than a year is reported
-as `stale_source` with the unchanged number; a currency that is not `AUD` is
-unresolved. Neither has a verified source in this store, so neither is guessed.
-
-Known data limitation: no ingest path writes `node_type='rate'` today, so this
-surface currently answers from rows the platform does not yet produce. A row
-with a verified source but no locator is `inferred`; a row whose document id no
-longer resolves is `evidence_unavailable`. Persisting a normalized rate, and
-binding one to a quantity claim, is deliberately deferred — it needs its own
-approval, audit and rollback path.
-
-### Phase 5D — Artifact/export engine ⬜ planned
-- Formula-linked Excel BOQ export with bounded, server-owned artifact handling.
-- Preserve evidence references and audit trails.
-- No arbitrary client filesystem paths or unbounded generated output.
+### Next — tablet/mobile workstation trial 🟡 planning
+- Extend the existing read-only Flutter shell to Android/tablet layouts.
+- Consume existing authenticated health, project, revision, rate, and artifact
+  contracts before adding new backend features.
+- Use synthetic/local data first. A physical tablet cannot reach `127.0.0.1`; any
+  remote device trial requires a separately approved controlled tunnel.
 
 ### Phase 6 — Tender portal automation and risk engine ⬜ planned
 - EstimateOne addenda and revision notices through a separately approved crawler.

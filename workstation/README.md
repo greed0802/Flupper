@@ -1,4 +1,4 @@
-# Flupper workstation (Phase 5A)
+# Flupper workstation (Phase 5A shell; tablet trial next)
 
 A read-only Flutter client for the local Flupper gateway.
 
@@ -16,8 +16,9 @@ client asks for one project by identifier and never assumes an array. There is
 no create route in the client either: creating a project mutates the store, and
 5A does not mutate anything.
 
-Revision diffing (5B), rate normalisation (5C) and BOQ export (5D) are not here.
-Each needs its own contract before it needs a screen.
+Revision diff, rate proposal, and artifact contracts now exist on the authenticated
+backend. This client currently exposes only health and single-project read views;
+5B–5D UI screens remain deferred to the tablet/mobile trial.
 
 ## Toolchain (pinned, and why this pin)
 
@@ -28,8 +29,9 @@ Each needs its own contract before it needs a screen.
 | `http` | 1.6.0 (resolved; `pubspec.lock` is committed) |
 | `flutter_lints` | 6.0.0 (resolved) |
 
-Every result recorded for Phase 5A - `flutter analyze --fatal-infos`, the 107
-tests, and `flutter build web` - came from those versions on Windows.
+Phase 5A was verified with `flutter analyze --fatal-infos`, 107 VM tests, Web build,
+and sequential per-file Chrome tests in CI. The current Flutter shell remains
+read-only; tablet/mobile UI work is planned separately.
 
 **The approved plan said 3.24.1. This pin is 3.47.2, deliberately.** The reason
 is not preference: 3.24.1 is not installed on this workstation, the only SDK
@@ -94,11 +96,9 @@ The cost is that each file starts its own Chrome session and its own compile, so
 the step is slower than one bulk invocation would be. That is the trade: a slower
 step that reports, over a faster one that hangs.
 
-This remains **not verified**. No runner with a Chrome executable has executed
-the loop yet - this workstation has no Chrome at all, and substituting Edge
-through `CHROME_EXECUTABLE` hung the harness instead of running the tests. The
-per-file form is untested in the same way the bulk form was, and calling it fixed
-before a Chrome-capable runner reports green would be a claim, not a result.
+The sequential per-file form is verified by the Workstation GitHub Actions job.
+A local machine without Chrome may still report this check as unavailable; that
+does not change the CI result.
 
 ## The address is configured, never assumed
 
@@ -172,6 +172,9 @@ lib/
     common/                the shared loading/failed/loaded view
     health/                GET /api/v1/health
     projects/              GET /api/v1/projects/{project_id}
+
+5B–5D DTOs exist in core, but tablet/mobile screens for revision, rates, and
+artifacts are intentionally deferred.
 test/                      no sockets: every response is bytes in memory
 ```
 
