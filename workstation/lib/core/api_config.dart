@@ -17,7 +17,18 @@
 /// The base address is an origin: scheme, host and optional port. A sub-path is
 /// refused so that route construction cannot drift; the API prefix lives in
 /// [ApiClient], next to the paths that use it.
+///
+/// Android emulator addresses
+/// --------------------------
+/// An Android emulator cannot reach the host at `127.0.0.1`, so development on
+/// Android names an emulator alias instead. That is a third rule with its own
+/// two conditions, so it is not an extra entry in the loopback set: see
+/// [AndroidEmulatorPolicy], which is consulted with [parse]'s `policy` argument.
+/// A release build answers `false` for every alias and the alias is refused with
+/// the same sentence any other non-loopback plaintext host gets.
 library;
+
+import 'android_loopback.dart';
 
 /// Raised for a base address that is absent, malformed or not permitted.
 ///
@@ -49,6 +60,10 @@ class ApiConfig {
       String.fromEnvironment('FLUPPER_API_URL');
 
   /// Hosts treated as the local machine for the plaintext exception.
+  ///
+  /// Only true loopback names. An Android emulator alias is **not** here: it is
+  /// not the local machine, it is a separate virtual machine, and it is admitted
+  /// by [AndroidEmulatorPolicy] under conditions this set cannot express.
   static const Set<String> loopbackHosts = <String>{
     'localhost',
     '127.0.0.1',
@@ -62,18 +77,29 @@ class ApiConfig {
   ///
   /// Throws [ApiConfigException] when it was supplied but is not permitted, so
   /// a bad `--dart-define` is reported instead of being ignored.
-  static ApiConfig? fromCompileTime() {
+  ///
+  /// [policy] is resolved from the running build by default. An Android debug
+  /// run may therefore pass `--dart-define=FLUPPER_API_URL=http://10.0.2.2:8000`
+  /// and have it accepted; the same define in a release build is refused.
+  static ApiConfig? fromCompileTime({AndroidEmulatorPolicy? policy}) {
     if (compileTimeBaseUrl.trim().isEmpty) {
       return null;
     }
-    return parse(compileTimeBaseUrl);
+    return parse(compileTimeBaseUrl, policy: policy);
   }
 
   /// Validates one address, or throws [ApiConfigException].
   ///
   /// Deliberately synchronous and dependency-free: the same function is used by
   /// the login form, by the compile-time path and by the tests.
-  static ApiConfig parse(String raw) {
+  ///
+  /// [policy] decides the one conditional exception - an Android debug build may
+  /// name an emulator alias in plaintext. When it is omitted the running build's
+  /// real facts are read through [AndroidEmulatorPolicy.current]; tests pass a
+  /// policy of their own so that both build modes are exercised without
+  /// pretending to change a compile-time constant.
+  static ApiConfig parse(String raw, {AndroidEmulatorPolicy? policy}) {
+    final activePolicy = policy ?? AndroidEmulatorPolicy.current();
     final trimmed = raw.trim();
     if (trimmed.isEmpty) {
       throw const ApiConfigException(
@@ -96,7 +122,11 @@ class ApiConfig {
     }
 
     final host = uri.host.toLowerCase();
-    if (scheme == 'http' && !loopbackHosts.contains(host)) {
+    if (scheme == 'http' &&
+        !loopbackHosts.contains(host) &&
+        !activePolicy.allowsPlaintextHost(host)) {
+      // One sentence for every refused host, emulator alias included. A refusal
+      // that named the reason would say which addresses a build accepts.
       throw const ApiConfigException(
         'Plaintext http is only allowed for the local machine. Use https.',
       );

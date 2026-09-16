@@ -403,4 +403,51 @@ void main() {
       );
     });
   });
+
+  group('fetchRateProposals', () {
+    test('POSTs exactly the named node ids', () async {
+      final transport = FakeTransport((request) async {
+        if (request.url.path != '/api/v1/projects/42/rates/proposals/normalize') {
+          return jsonResponse(404, <String, Object>{'detail': 'not found'});
+        }
+        if (request.method != 'POST') {
+          return jsonResponse(405, <String, Object>{});
+        }
+        final requestBody = await request.finalize().bytesToString();
+        if (requestBody != '{"node_ids":[1,2,3]}') {
+          return jsonResponse(400, <String, Object>{'detail': 'bad body'});
+        }
+        return jsonResponse(200, <String, Object?>{
+          'project_id': 42,
+          'reference_date': '2026-09-14',
+          'normalized': 0,
+          'unresolved': 0,
+          'warnings': [],
+          'proposals': [],
+        });
+      });
+      final response = await apiClient(transport).fetchRateProposals(
+        client: transport,
+        projectId: 42,
+        nodeIds: [1, 2, 3],
+      );
+      expect(response.projectId, 42);
+      expect(response.proposals, isEmpty);
+    });
+
+    test('refuses to send more node ids than the declared bound', () async {
+      final transport = FakeTransport((_) async => jsonResponse(200, {}));
+      
+      final tooMany = List<int>.generate(1001, (i) => i);
+      expect(
+        () => apiClient(transport).fetchRateProposals(
+          client: transport,
+          projectId: 42,
+          nodeIds: tooMany,
+        ),
+        throwsA(failureOf(ApiFailureKind.invalidRequest)),
+      );
+    });
+  });
+
 }

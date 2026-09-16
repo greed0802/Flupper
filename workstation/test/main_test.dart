@@ -13,6 +13,11 @@ import 'support/pump_until.dart';
 /// The shell decides which of the two screens exists. These tests pin that
 /// decision and the one transition that matters: a rejected token or a sign-out
 /// returns to the form and leaves no token behind.
+///
+/// Navigation during the tablet trial is additive: `ProjectView` gains two
+/// read-only panes, and the toolbar gains two icons that reach them. The tests
+/// that pin the *new* surface live in `test/features/`; what stays here is the
+/// shell's own promise - the project pane still offers no mutation.
 void main() {
   final config = ApiConfig.parse('http://127.0.0.1:8000');
 

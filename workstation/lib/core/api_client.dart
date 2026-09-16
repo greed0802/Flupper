@@ -21,6 +21,16 @@
 /// [ApiFailureKind.offline], because `http` reports it as a `ClientException`
 /// indistinguishable from a refused connection. Callers must therefore discard
 /// any result that arrives after they were disposed.
+///
+/// One route here is a POST
+/// ------------------------
+/// The rate proposal route is `POST /rates/proposals/normalize`. It is not a
+/// write: the request body names rate rows the server already holds and carries
+/// no rate, no unit, no currency, no category, no hash and no path, so the
+/// caller cannot assert what a rate is. Naming rows is what query languages do
+/// with a body, which is why the server used POST - and it is the reason
+/// [fetchRateProposals] can exist at all in a client that mutates nothing. No
+/// other route here has a body, and none has a method other than GET or POST.
 library;
 
 import 'dart:async';
@@ -33,6 +43,7 @@ import 'api_error.dart';
 import 'auth_storage.dart';
 import 'dto/health_response.dart';
 import 'dto/project_response.dart';
+import 'dto/rate_proposal_response.dart';
 import 'dto/revision_diff_response.dart';
 import 'dto_limits.dart';
 
@@ -69,6 +80,15 @@ class ApiClient {
       // Written as one literal on purpose: a route assembled from adjacent
       // string literals is a route the contract mirror test cannot read.
       '/api/v1/projects/$projectId/revisions/diff/$baseDocumentId/$targetDocumentId';
+
+  /// `POST /api/v1/projects/{project_id}/rates/proposals/normalize`.
+  ///
+  /// The only body-carrying route in this client, and the body carries ids and
+  /// nothing else. A rate proposal is a question about stored evidence, so the
+  /// path names the project and the body names the rows - no amount, unit,
+  /// currency, category, hash or path can be nominated from here.
+  static String rateProposalPath(int projectId) =>
+      '/api/v1/projects/$projectId/rates/proposals/normalize';
 
   /// Deadline for one request, covering the send and the body read.
   static const Duration defaultRequestTimeout = Duration(seconds: 10);
@@ -134,10 +154,55 @@ class ApiClient {
     );
   }
 
+  /// `POST /api/v1/projects/{projectId}/rates/proposals/normalize`.
+  ///
+  /// Every identifier is re-bounded here as well as in the widget that collects
+  /// it, because a bound that only exists in a widget is not a bound. [nodeIds]
+  /// is the whole body: the list is bounded to `[1, maxRateNodeIds]` entries of
+  /// values in `[1, maxRateExactInt]`, and an empty list is refused rather than
+  /// sent, because the server requires at least one id.
+  ///
+  /// Duplicates are sent as given. The server deduplicates, keeping the caller's
+  /// order, and it resolves each id inside the project - so a shorter or
+  /// reordered answer is a contract violation rather than something to
+  /// compensate for here.
+  Future<RateProposalResponse> fetchRateProposals({
+    required int projectId,
+    required List<int> nodeIds,
+    required http.Client client,
+  }) {
+    if (projectId < 1 || projectId > maxProjectId) {
+      throw const ApiFailure(ApiFailureKind.invalidRequest);
+    }
+    if (nodeIds.isEmpty || nodeIds.length > maxRateNodeIds) {
+      throw const ApiFailure(ApiFailureKind.invalidRequest);
+    }
+    for (final nodeId in nodeIds) {
+      if (nodeId < 1 || nodeId > maxRateExactInt) {
+        throw const ApiFailure(ApiFailureKind.invalidRequest);
+      }
+    }
+    return _sendJson(
+      client: client,
+      method: 'POST',
+      path: rateProposalPath(projectId),
+      body: <String, Object>{'node_ids': nodeIds},
+      parse: RateProposalResponse.fromJson,
+    );
+  }
+
   Future<T> _getJson<T>({
     required http.Client client,
     required String path,
     required T Function(Object? decoded) parse,
+  }) => _sendJson(client: client, path: path, parse: parse);
+
+  Future<T> _sendJson<T>({
+    required http.Client client,
+    required String path,
+    required T Function(Object? decoded) parse,
+    String method = 'GET',
+    Object? body,
   }) async {
     if (path.length > maxRequestPathChars ||
         !path.startsWith('$apiPrefix/') ||
@@ -155,9 +220,15 @@ class ApiClient {
       throw const ApiFailure(ApiFailureKind.invalidRequest);
     }
 
-    final request = http.Request('GET', uri)
+    final request = http.Request(method, uri)
       ..headers['accept'] = 'application/json'
       ..headers['authorization'] = 'Bearer $token';
+    if (body != null) {
+      // The one place a body is set. `jsonEncode` of a map of ints cannot carry
+      // a credential, and the header stays the only place the token appears.
+      request.headers['content-type'] = 'application/json';
+      request.body = jsonEncode(body);
+    }
 
     try {
       final response = await client.send(request).timeout(timeout);

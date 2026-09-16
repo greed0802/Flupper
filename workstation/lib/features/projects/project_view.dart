@@ -12,6 +12,8 @@
 library;
 
 import 'package:flutter/material.dart';
+import '../rates/rate_proposal_screen.dart';
+import '../revisions/revision_diff_screen.dart';
 import 'package:http/http.dart' as http;
 
 import '../../core/api_client.dart';
@@ -170,7 +172,35 @@ class _ProjectViewState extends State<ProjectView> {
                 Text('Id: ${project.projectId}'),
                 const SizedBox(height: 4),
                 Text('Name: ${project.name}'),
-                const SizedBox(height: 8),
+                const SizedBox(height: 16),
+                Row(
+                  children: [
+                    FilledButton(
+                      child: const Text('Revisions'),
+                      onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => RevisionDiffScreen(
+                          client: widget.client,
+                          projectId: project.projectId,
+                          clientFactory: widget.clientFactory,
+                          onUnauthorized: widget.onUnauthorized,
+                        ),
+                      )),
+                    ),
+                    const SizedBox(width: 12),
+                    FilledButton(
+                      child: const Text('Rates'),
+                      onPressed: () => Navigator.of(context).push(MaterialPageRoute(
+                        builder: (_) => RateProposalScreen(
+                          client: widget.client,
+                          projectId: project.projectId,
+                          clientFactory: widget.clientFactory,
+                          onUnauthorized: widget.onUnauthorized,
+                        ),
+                      )),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 16),
                 Text(
                   'Read-only. This view cannot create or change a project.',
                   style: Theme.of(context).textTheme.bodySmall,

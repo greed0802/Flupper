@@ -93,4 +93,63 @@ const int maxDiffScannedClaims = 2000;
 /// consequence of two constants rather than a constant of its own.
 const int maxDiffCount = maxDiffScannedNodes * 2;
 
+// ── Phase 5C: evidence-backed rate proposals ─────────────────────────────
+// The first response this client renders that carries money. Every bound below
+// either mirrors `qsagent.api.contracts` or says, in its own words, why it is
+// the client's own. A rate is quoted as a decimal string, so the string bounds
+// are the ones that stop a value from becoming an unbounded label.
+
+/// Mirrors `qsagent.api.contracts.MAX_RATE_NODE_IDS`.
+///
+/// The number of ids one request may name, and therefore the ceiling on the
+/// proposal list: one proposal per id. It bounds *both* directions, which is why
+/// the client validates the request list against it before sending.
+const int maxRateNodeIds = 100;
+
+/// Mirrors `qsagent.api.contracts.MAX_RATE_TEXT_CHARS`.
+const int maxRateTextChars = 255;
+
+/// Mirrors `qsagent.api.contracts.MAX_RATE_HASH_CHARS`.
+const int maxRateHashChars = 64;
+
+/// Mirrors `qsagent.api.contracts.MAX_RATE_AMOUNT_CHARS`.
+///
+/// The bound on `original_amount` and `normalized_amount`, which are decimal
+/// *strings* rather than numbers. The client renders them as text and never
+/// parses them: `Decimal` arithmetic belongs to the server, and a client that
+/// recomputed a rate would be a second implementation of the thing the platform
+/// exists to make single.
+const int maxRateAmountChars = 64;
+
+/// Mirrors `qsagent.api.contracts.MAX_RATE_DATE_CHARS`.
+const int maxRateDateChars = 10;
+
+/// Mirrors `qsagent.api.contracts.MAX_RATE_WARNINGS`.
+const int maxRateWarnings = 8;
+
+/// Largest value the client accepts for a rate field the server leaves
+/// unbounded.
+///
+/// Client-only, and it covers two different jobs, which is why it is not named
+/// after either of them:
+///
+/// * a **rate node id**. The server's own ceiling is `MAX_RATE_NODE_ID`
+///   (`9223372036854775807`), which is larger than this one, so this is the
+///   stricter of the two. A larger id would be silently rounded on the way into
+///   a URL in a Dart web build, so it is refused here instead of being sent as a
+///   different number;
+/// * `duplicate_quote_count` and `source_age_days`, which the server declares as
+///   plain `int` with no ceiling at all. An unbounded integer from the wire is a
+///   number a widget has to be willing to format, so the client bounds it.
+///
+/// `2^53 - 1` is the largest integer a Dart web build represents exactly - the
+/// same bound, for the same reason, as [maxProjectId].
+const int maxRateExactInt = 9007199254740991;
+
+/// Mirrors `qsagent.api.contracts.MAX_RATE_SCANNED_DOCUMENTS`. Not rendered by
+/// this client; it is asserted against the server so the mirror list stays
+/// honest, and it is the ceiling that makes the server's
+/// `source_documents_truncated` warning meaningful rather than mysterious.
+const int maxRateScannedDocuments = 2000;
+
 

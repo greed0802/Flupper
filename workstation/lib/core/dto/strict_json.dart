@@ -177,6 +177,66 @@ String requireOneOf(
   return value;
 }
 
+/// Requires a nullable string field whose value is one of a fixed vocabulary.
+///
+/// The 5C proposal contract has both shapes: `status` and `confidence` are
+/// always present, while `reason`, `normalized_unit`, `currency` and
+/// `rate_category` are `null` on one side of the normalized/unresolved split.
+/// A value outside the vocabulary is malformed rather than unknown, because the
+/// server's vocabulary is a closed `Literal` set.
+String? requireOptionalOneOf(
+  Map<String, Object?> map,
+  String key, {
+  required Set<String> allowed,
+}) {
+  if (map[key] == null) {
+    return null;
+  }
+  return requireOneOf(map, key, allowed: allowed);
+}
+
+/// Requires a nullable integer field in `[0, maxValue]`.
+int? requireOptionalCount(
+  Map<String, Object?> map,
+  String key, {
+  required int maxValue,
+}) {
+  if (map[key] == null) {
+    return null;
+  }
+  return requireCount(map, key, maxValue: maxValue);
+}
+
+/// Requires a list of strings drawn from a fixed vocabulary.
+///
+/// Phase 5C's `warnings` fields are closed `Literal` sets, so an entry outside
+/// the vocabulary is malformed rather than unknown: it is a value the server
+/// cannot send, which means the two sides disagree about the contract.
+List<String> requireBoundedOneOfList(
+  Map<String, Object?> map,
+  String key, {
+  required Set<String> allowed,
+  required int maxLength,
+}) {
+  final entries = requireBoundedList(map, key, maxLength: maxLength);
+  final values = <String>[];
+  for (final entry in entries) {
+    if (entry is! String || !allowed.contains(entry)) {
+      throw _malformed();
+    }
+    values.add(entry);
+  }
+  return values;
+}
+
+/// Throws [ApiFailureKind.malformed] from a DTO's own cross-field check.
+///
+/// The readers above each cover one field. This is for the checks that only
+/// exist *between* fields - a response whose summary counts contradict the list
+/// beneath it - so that such a failure leaves through the same door as every
+/// other refusal instead of a second exception type.
+Never malformed() => throw _malformed();
+
 /// Requires a nested JSON object, returned as a plain map.
 Map<String, Object?> requireNestedMap(Map<String, Object?> map, String key) {
   final value = map[key];

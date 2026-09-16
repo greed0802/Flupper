@@ -5,6 +5,7 @@ import 'package:flupper_workstation/core/dto/project_response.dart';
 import 'package:flupper_workstation/core/dto/revision_change.dart';
 import 'package:flupper_workstation/core/dto/revision_diff_response.dart';
 import 'package:flupper_workstation/core/dto_limits.dart';
+import 'package:flupper_workstation/core/dto/rate_proposal_response.dart';
 
 /// Runs [action] and returns the failure it raises, failing the test if none.
 ApiFailure malformedFrom(void Function() action) {
@@ -366,6 +367,47 @@ void main() {
     test('render fixed local copy', () {
       const failure = ApiFailure(ApiFailureKind.malformed);
       expect(failure.userMessage, 'The gateway response could not be read.');
+    });
+  });
+
+  group('RateProposalResponse', () {
+    Map<String, Object?> valid() => <String, Object?>{
+      'project_id': 42,
+      'reference_date': '2026-09-14',
+      'normalized': 1,
+      'unresolved': 0,
+      'warnings': <Object?>[],
+      'proposals': <Object?>[
+        <String, Object?>{
+          'node_id': 100,
+          'label': 'Rate 1',
+          'status': 'normalized',
+          'confidence': 'exact',
+          'reason': null,
+          'source_document_id': 200,
+          'source_file_name': 'source.pdf',
+          'source_file_hash': 'abc',
+          'original_amount': '100.00',
+          'original_unit': 'm2',
+          'normalized_amount': '100.00',
+          'normalized_unit': 'm2',
+          'currency': 'AUD',
+          'rate_category': 'labour_time',
+          'effective_date': '2026-01-01',
+          'source_age_days': 250, 'locator_present': true, 'duplicate_quote_count': 0, 'warnings': <Object?>[],
+        }
+      ]
+    };
+
+    test('parses the declared shape', () {
+      final response = RateProposalResponse.fromJson(valid());
+      expect(response.projectId, 42);
+      expect(response.proposals, hasLength(1));
+    });
+
+    test('refuses an unknown key', () {
+      final data = valid()..['x'] = 1;
+      expect(malformedFrom(() => RateProposalResponse.fromJson(data)).kind, ApiFailureKind.malformed);
     });
   });
 }

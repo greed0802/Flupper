@@ -19,6 +19,7 @@ class ResourceView<T> extends StatelessWidget {
     required this.onRetry,
     required this.title,
     required this.builder,
+    this.scrolling = false,
   });
 
   final bool loading;
@@ -28,9 +29,22 @@ class ResourceView<T> extends StatelessWidget {
   final String title;
   final Widget Function(BuildContext context, T data) builder;
 
+  /// When true, the loaded body is handed a bounded, scrollable area instead of
+  /// being wrapped in a `Center`d column that is only as tall as its content.
+  ///
+  /// The tablet panes render lists the server is allowed to send in full (up to
+  /// 500 diff items, up to 100 proposals). A `ListView` needs a bounded height,
+  /// and a `Center`ed `Column` with `mainAxisSize.min` is exactly the constraint
+  /// that cannot give it one. This flag is off by default, so the 5A panes keep
+  /// the layout their tests were written against.
+  final bool scrolling;
+
   @override
   Widget build(BuildContext context) {
-    final body = _body(context);
+    return scrolling ? _scrollableFrame(context) : _centredFrame(context);
+  }
+
+  Widget _centredFrame(BuildContext context) {
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24),
@@ -42,7 +56,30 @@ class ResourceView<T> extends StatelessWidget {
             children: <Widget>[
               Text(title, style: Theme.of(context).textTheme.titleLarge),
               const SizedBox(height: 16),
-              body,
+              _body(context),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _scrollableFrame(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(24),
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: ConstrainedBox(
+          // On a 12-inch tablet in landscape the default width would stretch a
+          // provenance line to the full screen and make it unreadable. Bounding
+          // the column is what keeps a rate and its source on one eye line.
+          constraints: const BoxConstraints(maxWidth: 720),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(title, style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 16),
+              Expanded(child: _body(context)),
             ],
           ),
         ),
