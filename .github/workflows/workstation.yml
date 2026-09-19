@@ -49,9 +49,12 @@ jobs:
       - name: Install Android API 34 tooling
         shell: bash
         run: |
-          command -v sdkmanager
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "${sdk_root}"
+          sdkmanager_path="$(find "${sdk_root}" -type f -name sdkmanager -print -quit)"
+          test -n "${sdkmanager_path}"
+          yes | "${sdkmanager_path}" --licenses >/dev/null || true
+          "${sdkmanager_path}" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Report the toolchain
         run: flutter --version
