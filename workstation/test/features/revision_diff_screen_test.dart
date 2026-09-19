@@ -39,7 +39,7 @@ void main() {
   }
 
   testWidgets('renders diff changes on success', (tester) async {
-    String digest(String input) => List.filled(64, '0').join();
+    String digest(String input) => List.filled(64, input).join();
     final document = {
       'document_id': 1, 'file_name': 'synthetic.pdf', 'file_hash': digest('a'),
       'drawing_no': 'C-204', 'revision': 'A', 'evidence_rows': 1, 'evidence_truncated': false,
@@ -54,7 +54,7 @@ void main() {
       'counts': {'added': 0, 'removed': 0, 'changed': 1, 'unchanged': 0, 'ambiguous': 0, 'unresolved': 0},
       'items': [
         {
-           'identity_id': 'f1', 'status': 'changed', 'group_size': 1,
+           'identity_id': digest('f'), 'status': 'changed', 'group_size': 1,
            'base': evidence, 'target': evidence, 'changed_fields': ['value'], 'affected_claim_ids': ['c1'], 'affected_claims_omitted': 0, 'reason': null
         }
       ],
