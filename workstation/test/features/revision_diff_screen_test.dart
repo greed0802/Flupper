@@ -63,8 +63,9 @@ void main() {
     }));
     await pump(tester, transport);
     await ask(tester, '1', '2');
-    await pumpUntilFound(tester, find.textContaining('f1'));
-    expect(find.textContaining('f1'), findsOneWidget);
+    final identity = List.filled(64, 'f').join();
+    await pumpUntilFound(tester, find.textContaining(identity));
+    expect(find.textContaining(identity), findsOneWidget);
   });
 
   testWidgets('displays a 404 message', (tester) async {
