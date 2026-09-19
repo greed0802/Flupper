@@ -38,13 +38,14 @@ void main() {
   }
 
   testWidgets('renders proposals on success', (tester) async {
+    final sourceHash = List.filled(64, 'a').join();
     final transport = FakeTransport((_) async => jsonResponse(200, <String, Object?>{
       'project_id': 42, 'reference_date': '2026-09-14', 'normalized': 1, 'unresolved': 0,
       'warnings': [],
       'proposals': [
         {
           'node_id': 100, 'label': 'Rate 1', 'status': 'normalized', 'confidence': 'exact', 'reason': null,
-          'source_document_id': 200, 'source_file_name': 's.pdf', 'source_file_hash': 'abc',
+          'source_document_id': 200, 'source_file_name': 's.pdf', 'source_file_hash': sourceHash,
           'original_amount': '1.0', 'original_unit': 'm', 'normalized_amount': '1.0', 'normalized_unit': 'm',
           'currency': 'AUD', 'rate_category': 'labour_time', 'effective_date': '2026-01-01', 'source_age_days': 200,
           'locator_present': true, 'duplicate_quote_count': 0, 'warnings': []
